@@ -623,11 +623,27 @@ impl DeviceQueryState {
     /// append); never blocks and never panics on an I/O error — logs and
     /// leaves state unchanged instead, matching every other best-effort
     /// stance in this crate (`recorder.rs`, `port.rs`).
+    ///
+    /// # Concurrency
+    ///
+    /// `recorder_cursor`'s guard is held across the whole read-decode-append
+    /// sequence, not just the two moments the cursor is read and written.
+    /// Ingest is a read-modify-write over shared state, and it genuinely
+    /// runs concurrently: [`spawn_poller`]'s loop and every web handler that
+    /// calls `state.ingest(&recorder)` before serving a request are separate
+    /// callers. Taking the cursor and dropping the lock let two of them read
+    /// the same value, decode the same records, and append both copies —
+    /// which is exactly how a device came to have `seq` 192278..192280
+    /// stored once on disk but present twice in `events`, and duplicated in
+    /// every `tail`/`read_since` reply from then on. Serializing the whole
+    /// operation makes the loser of the race observe the winner's cursor and
+    /// find nothing new, which is the correct outcome.
     pub fn ingest(&self, recorder: &Recorder) {
-        let cursor = *self
+        let mut recorder_cursor = self
             .recorder_cursor
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let cursor = *recorder_cursor;
         let page = match recorder.read_since(cursor, MAX_INGEST_BYTES) {
             Ok(page) => page,
             Err(ReadSinceError::DataAgedOut {
@@ -658,10 +674,7 @@ impl DeviceQueryState {
         };
 
         if page.records.is_empty() {
-            *self
-                .recorder_cursor
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = page.next_cursor;
+            *recorder_cursor = page.next_cursor;
             return;
         }
 
@@ -793,18 +806,34 @@ impl DeviceQueryState {
             }
         }
 
-        *self
-            .recorder_cursor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = page.next_cursor;
+        *recorder_cursor = page.next_cursor;
+        drop(recorder_cursor);
         if added {
             self.notify.notify_waiters();
         }
     }
 
-    /// Last `n` lines (after `filter`), plus every out-of-band event known
-    /// so far, plus a cursor a caller can `read_since` from to continue
-    /// live. See the module docs for why events are never filtered.
+    /// Last `n` lines (after `filter`) and the out-of-band events from the
+    /// same recent window, plus a cursor a caller can `read_since` from to
+    /// continue live. See the module docs for why events are never filtered
+    /// (only, as here, range-bounded).
+    ///
+    /// # Why the events are bounded rather than complete
+    ///
+    /// This used to hand back `events.clone()` — the device's *entire*
+    /// out-of-band history, no matter how small `n` was. That history only
+    /// ever grows (every connect, disconnect, config change and gate
+    /// decision the device has ever seen), so a long-lived device
+    /// eventually returns a reply dominated by records from days ago. The
+    /// presentation layer's size cap then has nothing current left to spend
+    /// its budget on — see [`crate::presentation::present_tail`]'s docs for
+    /// how that surfaced as a GUI replaying stale logs on every page load.
+    ///
+    /// The window is the lower of "where the returned lines start" and
+    /// "the last `n` events", so both halves of the reply stay bounded by
+    /// the caller's own `n` and a device that emits events but no lines
+    /// (or vice versa) still gets a useful tail. Anything older is a
+    /// `read_since`/`query_events` question, not a `tail` one.
     pub fn tail(&self, n: usize, filter: Option<&Filter>) -> Result<QueryPage, QueryError> {
         let compiled = compile_filter(filter)?;
         let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
@@ -818,6 +847,20 @@ impl DeviceQueryState {
         let start = filtered.len().saturating_sub(n);
         let picked = filtered[start..].to_vec();
 
+        let picked_events: Vec<OobRecord> = if n == 0 {
+            Vec::new()
+        } else {
+            let line_floor = picked.first().map(|l| l.seq);
+            let event_floor = events.get(events.len().saturating_sub(n)).map(|e| e.seq);
+            let floor = match (line_floor, event_floor) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => 0,
+            };
+            events.iter().filter(|e| e.seq >= floor).cloned().collect()
+        };
+
         let newest_line = lines.last().map(|l| l.seq);
         let newest_event = events.last().map(|e| e.seq);
         let cursor = newest_line
@@ -828,7 +871,7 @@ impl DeviceQueryState {
 
         Ok(QueryPage {
             lines: picked,
-            events: events.clone(),
+            events: picked_events,
             cursor,
         })
     }
@@ -921,7 +964,11 @@ impl DeviceQueryState {
         limits: &crate::presentation::PresentationLimits,
     ) -> Result<crate::presentation::PresentedPage, QueryError> {
         let page = self.tail(n, filter)?;
-        Ok(crate::presentation::present(
+        // `present_tail`, not `present`: a tail's budget must be spent on
+        // its newest records, and its cursor must stay at the tip so a
+        // caller subscribing from it gets what comes next rather than a
+        // replay of everything since the cut. See that function's docs.
+        Ok(crate::presentation::present_tail(
             &page.lines,
             &page.events,
             page.cursor,
@@ -1236,6 +1283,114 @@ mod tests {
         let page = state.read_since(0, None, None).unwrap();
         let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, vec!["a", "b", "c"]);
+    }
+
+    // ---- tail's event window is bounded by n ----
+
+    /// A device that has been plugged in and out all week, then emitted a
+    /// few lines: `tail(3)` must answer with the recent window, not with
+    /// every connect/disconnect since the device was first seen. Returning
+    /// the whole history here is what left the presentation layer's size cap
+    /// with nothing current to spend its budget on.
+    #[test]
+    fn tail_does_not_return_the_devices_entire_event_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+
+        for _ in 0..40 {
+            recorder.append_event("disconnect", Map::new()).unwrap();
+            recorder.append_event("connect", Map::new()).unwrap();
+        }
+        recorder.append_rx(b"one\ntwo\nthree\nfour\n").unwrap();
+        state.ingest(&recorder);
+
+        let page = state.tail(3, None).unwrap();
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["two", "three", "four"]);
+        assert!(
+            page.events.len() <= 3,
+            "tail(3) must not hand back all 80 historical events, got {}",
+            page.events.len()
+        );
+    }
+
+    /// The window still has to cover events, not just lines: a device that
+    /// emits events and no output at all must still produce a useful tail.
+    #[test]
+    fn tail_returns_recent_events_for_a_device_with_no_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+
+        for _ in 0..10 {
+            recorder.append_event("disconnect", Map::new()).unwrap();
+        }
+        state.ingest(&recorder);
+
+        let page = state.tail(4, None).unwrap();
+        assert!(page.lines.is_empty());
+        assert_eq!(page.events.len(), 4, "the last n events, not all of them");
+    }
+
+    /// Events must stay reachable in full — `tail` narrowing its window is a
+    /// presentation choice, not data loss.
+    #[test]
+    fn read_since_still_returns_every_event_tail_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+
+        for _ in 0..40 {
+            recorder.append_event("disconnect", Map::new()).unwrap();
+        }
+        recorder.append_rx(b"line\n").unwrap();
+        state.ingest(&recorder);
+
+        assert_eq!(state.read_since(0, None, None).unwrap().events.len(), 40);
+    }
+
+    // ---- ingest is a read-modify-write and must be serialized ----
+
+    /// Two callers ingesting at once (the background poller and a web
+    /// handler, in production) must not both decode and append the same
+    /// records. Before `ingest` held its cursor guard across the whole
+    /// operation, they did: a real device ended up with `seq` 192278..192280
+    /// stored once on disk but present twice in memory, duplicated in every
+    /// reply from then on.
+    #[test]
+    fn concurrent_ingest_never_appends_the_same_record_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = std::sync::Arc::new(recorder(tmp.path()));
+        let state = std::sync::Arc::new(DeviceQueryState::new());
+
+        for i in 0..50 {
+            let mut extra = Map::new();
+            extra.insert("i".to_string(), i.into());
+            recorder.append_event("disconnect", extra).unwrap();
+        }
+        recorder.append_rx(b"a\nb\nc\n").unwrap();
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let state = std::sync::Arc::clone(&state);
+                let recorder = std::sync::Arc::clone(&recorder);
+                std::thread::spawn(move || state.ingest(&recorder))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let page = state.read_since(0, None, None).unwrap();
+        let mut event_seqs: Vec<u64> = page.events.iter().map(|e| e.seq).collect();
+        let before = event_seqs.len();
+        event_seqs.dedup();
+        assert_eq!(before, event_seqs.len(), "duplicate event seqs ingested");
+        assert_eq!(before, 50);
+
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "b", "c"], "duplicate lines ingested");
     }
 
     // ---- Issue #52: CR-only line assembly ----

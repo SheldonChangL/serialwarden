@@ -114,17 +114,26 @@ fn get_config_description() -> String {
 /// Shared tail of `tail`'s and `read_since`'s descriptions: what the
 /// context-protection presentation layer (`TASKS.md` T3.2, issue #13) does
 /// to the raw line stream before it reaches you, and how to relax it.
-const CONTEXT_PROTECTION_NOTICE: &str = "Before returning, this result is passed through a context-protection layer so a chatty device or a corrupted/binary payload can't flood your context: 3+ consecutive identical lines collapse into one entry with a `count` and a `first_seq`/`last_seq` range (tagged `\"folded\": true`); a line whose invalid-UTF-8 byte proportion crosses `binary_ratio_threshold` is summarized as a byte `length` plus a `hex_preview` of its first bytes instead of a wall of replacement characters; and the whole reply is capped to roughly `max_result_bytes`, in which case `truncated` is `true` and `cursor` already points to exactly where to resume — pass it straight to your next `read_since` call, never skipping or repeating a record regardless of how the view was compressed. All three of `max_result_bytes`/`binary_ratio_threshold`/`fold_min_run` can be widened per call (e.g. set `binary_ratio_threshold` near 1.0 to see more raw text, or raise `max_result_bytes` if you specifically need a bigger single reply).";
+///
+/// Deliberately says nothing about which *end* of a page the size cap keeps
+/// or what the returned `cursor` then means: those differ between the two
+/// tools (see `serialwrapd::presentation::present_tail`'s docs), so each
+/// description states its own.
+const CONTEXT_PROTECTION_NOTICE: &str = "Before returning, this result is passed through a context-protection layer so a chatty device or a corrupted/binary payload can't flood your context: 3+ consecutive identical lines collapse into one entry with a `count` and a `first_seq`/`last_seq` range (tagged `\"folded\": true`); a line whose invalid-UTF-8 byte proportion crosses `binary_ratio_threshold` is summarized as a byte `length` plus a `hex_preview` of its first bytes instead of a wall of replacement characters; and the whole reply is capped to roughly `max_result_bytes`, in which case `truncated` is `true`. All three of `max_result_bytes`/`binary_ratio_threshold`/`fold_min_run` can be widened per call (e.g. set `binary_ratio_threshold` near 1.0 to see more raw text, or raise `max_result_bytes` if you specifically need a bigger single reply).";
 
 fn tail_description() -> String {
     format!(
         "Return the last `n` assembled lines of a device's recorded output (optionally \
          narrowed by a regex `filter`), each with its sequence number and timestamp, plus \
-         any out-of-band events (disconnects, lease activity, config changes) that have \
-         happened on this device since your last call on it — these are always included \
-         even if `filter` would otherwise exclude them, and regardless of which tool you \
-         called last. Also returns a `cursor` you can pass to `read_since` to continue \
-         reading from exactly this point. Read-only.\n\n{CONTEXT_PROTECTION_NOTICE}\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
+         the out-of-band events (disconnects, lease activity, config changes) from that \
+         same recent window that are new since your last call on this device — these are \
+         always included even if `filter` would otherwise exclude them, and regardless of \
+         which tool you called last. Also returns a `cursor`: for `tail` this is always \
+         the tip of the stream as of this call, so passing it to `read_since` gives you \
+         what arrives *next*. When `truncated` is `true`, the size cap dropped the \
+         *oldest* records of this page — a tail always spends its budget on the most \
+         recent data. To see further back, raise `max_result_bytes`, or `read_since` an \
+         earlier cursor. Read-only.\n\n{CONTEXT_PROTECTION_NOTICE}\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
     )
 }
 
@@ -136,7 +145,10 @@ fn read_since_description() -> String {
          timestamp; out-of-band events in the same range are always included regardless \
          of `filter`. Returns the next `cursor` — reading a stream in bounded chunks this \
          way yields exactly the records reading it all at once would, no gaps or \
-         duplicates. Read-only.\n\n{CONTEXT_PROTECTION_NOTICE}\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
+         duplicates. Unlike `tail`, when `truncated` is `true` this page kept its \
+         *oldest* records and `cursor` points at exactly where it stopped, so passing it \
+         straight back resumes without skipping or repeating anything, regardless of how \
+         the view was compressed. Read-only.\n\n{CONTEXT_PROTECTION_NOTICE}\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
     )
 }
 
@@ -556,16 +568,16 @@ impl ToolRegistry {
             })
             .await?;
         check_ok(&reply)?;
-        let presented = present_reply(&reply, limits);
-        // `tail`'s own daemon reply always carries the device's *entire*
-        // out-of-band event history (see `query::DeviceQueryState::tail`'s
-        // docs — filters narrow lines, never events, and `tail` itself has
-        // no cursor of its own to bound them by), not just what's new since
-        // this bridge last looked. `take_new` is what turns that into "only
-        // since your last call on it", matching `tail_description()`'s
-        // contract and avoiding handing back (and re-growing) the same
-        // event list on every single call over a long session. It operates
-        // on `presented.events` (already possibly narrowed by the
+        let presented = present_reply(&reply, limits, Edge::Newest);
+        // `tail`'s daemon reply carries the out-of-band events from the
+        // same recent window as its lines (see
+        // `query::DeviceQueryState::tail`'s docs — filters narrow lines,
+        // never events, so events are range-bounded instead), not just what
+        // is new since this bridge last looked. `take_new` is what turns
+        // that into "only since your last call on it", matching
+        // `tail_description()`'s contract and avoiding handing back the
+        // same event list on every single call over a long session. It
+        // operates on `presented.events` (already possibly narrowed by the
         // context-protection size cap — see `present_reply`), which is
         // still correct: an event this page's size cap deferred simply
         // isn't "new" yet from the watermark's point of view either, and
@@ -601,7 +613,7 @@ impl ToolRegistry {
             })
             .await?;
         check_ok(&reply)?;
-        let presented = present_reply(&reply, limits);
+        let presented = present_reply(&reply, limits, Edge::Oldest);
         // Unlike `tail`, `read_since`'s events are already correctly
         // bounded to `[cursor, next_cursor)` by the caller's own explicit
         // `cursor` argument (see `query::DeviceQueryState::read_since`'s
@@ -823,7 +835,22 @@ impl ToolRegistry {
 /// here: the wire reply already carries every field losslessly (the
 /// raw_b64 rule — see `line.rs`), so reconstructing is never a lossy
 /// approximation.
-fn present_reply(reply: &Value, limits: &PresentationLimits) -> presentation::PresentedPage {
+/// Which end of a reply the size cap keeps when it cannot keep everything —
+/// the one decision `tail` and `read_since` make differently. See
+/// `serialwrapd::presentation::present_tail`'s docs for why.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    /// Keep the oldest prefix and report a continuation cursor (pagination).
+    Oldest,
+    /// Keep the newest suffix and leave the cursor at the tip (`tail`).
+    Newest,
+}
+
+fn present_reply(
+    reply: &Value,
+    limits: &PresentationLimits,
+    edge: Edge,
+) -> presentation::PresentedPage {
     let lines: Vec<_> = reply["lines"]
         .as_array()
         .map(Vec::as_slice)
@@ -839,7 +866,10 @@ fn present_reply(reply: &Value, limits: &PresentationLimits) -> presentation::Pr
         .map(oob_from_wire)
         .collect();
     let full_cursor = reply["cursor"].as_u64().unwrap_or(0);
-    presentation::present(&lines, &events, full_cursor, limits)
+    match edge {
+        Edge::Oldest => presentation::present(&lines, &events, full_cursor, limits),
+        Edge::Newest => presentation::present_tail(&lines, &events, full_cursor, limits),
+    }
 }
 
 /// Parse `tail`/`read_since`'s optional context-protection overrides (see

@@ -77,6 +77,24 @@
 //!    the view's perspective (a folded block of many, or a compact binary
 //!    summary) differ.
 //!
+//! # Two truncation directions
+//!
+//! The three invariants above describe [`present`], which serves
+//! `read_since`-shaped queries: the cap keeps the oldest prefix and the
+//! cursor points at the cut, because a paginating caller must be able to
+//! reach whatever was left out.
+//!
+//! [`present_tail`] serves `tail`-shaped queries, where the caller asked for
+//! the *most recent* records and the reply also carries out-of-band events
+//! whose `seq` are inherently much older than the newest lines (a device's
+//! connect/disconnect history starts at `seq` 0 and only grows). There the
+//! ascending direction is actively wrong — it spends the entire budget on
+//! stale events and reports a cursor pointing back into them — so the cap
+//! keeps the newest suffix and the cursor stays at the tip. Invariants 1 and
+//! 2 still hold (disjoint ranges, whole items, one item minimum); only which
+//! contiguous run survives differs. See that function's own docs for the
+//! failure it was written against.
+//!
 //! # Known limitation
 //!
 //! A single line whose *own* rendered JSON already exceeds
@@ -378,17 +396,14 @@ impl ViewItem {
     }
 }
 
-/// Apply duplicate-line folding, binary summarization, and the overall size
-/// cap to `lines`/`events` — the complete raw output of one `tail`/
-/// `read_since`-shaped query, plus `full_cursor` (that same query's own
-/// already-correct next cursor). See the module docs for the full
-/// cursor-correctness argument.
-pub fn present(
+/// Fold, summarize, and merge `lines`/`events` into one seq-ordered view.
+/// Shared by [`present`] and [`present_tail`], which differ only in which
+/// end of this sequence the size cap keeps.
+fn build_items(
     lines: &[AssembledLine],
     events: &[OobRecord],
-    full_cursor: u64,
     limits: &PresentationLimits,
-) -> PresentedPage {
+) -> Vec<ViewItem> {
     let event_seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
     let groups = group_lines(lines, &event_seqs, limits);
 
@@ -403,8 +418,27 @@ pub fn present(
     }
     // Ranges are pairwise disjoint by construction (invariant 1 in the
     // module docs), so sorting by start == sorting by end; ascending
-    // start-seq order is what makes the truncation loop below safe.
+    // start-seq order is what makes both truncation loops safe.
     items.sort_by_key(ViewItem::start_seq);
+    items
+}
+
+/// Apply duplicate-line folding, binary summarization, and the overall size
+/// cap to `lines`/`events` — the complete raw output of one
+/// `read_since`-shaped query, plus `full_cursor` (that same query's own
+/// already-correct next cursor). See the module docs for the full
+/// cursor-correctness argument.
+///
+/// The size cap keeps the **oldest** prefix and reports a continuation
+/// cursor for the rest, which is what pagination through a stream needs.
+/// `tail`-shaped queries want the opposite end — use [`present_tail`].
+pub fn present(
+    lines: &[AssembledLine],
+    events: &[OobRecord],
+    full_cursor: u64,
+    limits: &PresentationLimits,
+) -> PresentedPage {
+    let items = build_items(lines, events, limits);
 
     let mut out_lines = Vec::new();
     let mut out_events = Vec::new();
@@ -440,6 +474,76 @@ pub fn present(
         lines: out_lines,
         events: out_events,
         cursor,
+        truncated,
+    }
+}
+
+/// [`present`]'s counterpart for `tail`-shaped queries: identical folding
+/// and summarization, but the size cap keeps the **newest** items and drops
+/// the oldest, and the returned cursor is always `full_cursor` (the stream
+/// tip the underlying `tail` computed).
+///
+/// # Why `tail` cannot share `present`'s truncation direction
+///
+/// [`present`] fills its budget from the oldest item forward because a
+/// `read_since` caller is paginating: whatever the cap excludes must stay
+/// reachable through the returned cursor, so the page has to be a *prefix*
+/// and the cursor has to point at the cut.
+///
+/// `tail(n)` asks the opposite question — "the most recent records" — and
+/// its reply carries out-of-band events whose `seq` are, by nature, far
+/// older than the newest lines (a device's connect/disconnect history
+/// starts at `seq` 0 and only grows). Filling an ascending budget from
+/// there spends the entire cap on stale events before reaching a single
+/// current line, and then reports a cursor pointing back into that ancient
+/// history. A GUI that subscribes from the cursor its own `tail` just
+/// returned (see `webui/src/lib/logStream.ts`) then replays days of records
+/// on every page load, showing nothing current — the exact failure this
+/// function exists to prevent.
+///
+/// So the budget is filled newest-first and `truncated` means "older
+/// records were left out", not "there is more to come". The cursor stays at
+/// the tip: what the cap dropped here is *behind* the caller, outside what
+/// `tail` was asked for, and remains reachable through `read_since`.
+pub fn present_tail(
+    lines: &[AssembledLine],
+    events: &[OobRecord],
+    full_cursor: u64,
+    limits: &PresentationLimits,
+) -> PresentedPage {
+    let items = build_items(lines, events, limits);
+
+    let mut bytes_used = ENVELOPE_BUDGET_RESERVE;
+    let mut truncated = false;
+    let mut kept: Vec<ViewItem> = Vec::new();
+
+    for item in items.into_iter().rev() {
+        let size = item.json_size();
+        // Same forward-progress guarantee `present` makes: one item always
+        // survives, even if it alone busts the cap (module docs' Known
+        // limitation).
+        if !kept.is_empty() && bytes_used + size > limits.max_result_bytes {
+            truncated = true;
+            break;
+        }
+        bytes_used += size;
+        kept.push(item);
+    }
+    kept.reverse();
+
+    let mut out_lines = Vec::new();
+    let mut out_events = Vec::new();
+    for item in kept {
+        match item {
+            ViewItem::Line(l) => out_lines.push(l),
+            ViewItem::Event(e) => out_events.push(e),
+        }
+    }
+
+    PresentedPage {
+        lines: out_lines,
+        events: out_events,
+        cursor: full_cursor,
         truncated,
     }
 }
@@ -886,6 +990,106 @@ mod tests {
         assert_eq!(page.cursor, last_included_seq + 1);
         // Nothing beyond the cursor was silently included.
         assert!(page.lines.iter().all(|l| l.last_seq() < page.cursor));
+    }
+
+    // ---- present_tail: the size cap keeps the newest end ----
+
+    /// The exact shape that broke a real deployment: a device with a long
+    /// out-of-band history (every connect/disconnect since it was first
+    /// plugged in, `seq` starting at 0) and current log lines several
+    /// hundred thousand `seq` later. `present`'s ascending budget spends
+    /// everything on the ancient events and reports a cursor pointing back
+    /// into them; a GUI subscribing from that cursor replays days of
+    /// records and never shows anything current. `present_tail` must return
+    /// the recent lines and leave the cursor at the tip.
+    #[test]
+    fn tail_spends_its_budget_on_recent_lines_not_ancient_event_history() {
+        let events: Vec<OobRecord> = (0..200u64).map(event).collect();
+        let lines: Vec<AssembledLine> = (500_000..500_040u64)
+            .map(|i| line(i, format!("current device output line {i}").as_bytes()))
+            .collect();
+        let tip = 500_040;
+
+        let ascending = present(&lines, &events, tip, &PresentationLimits::default());
+        assert!(
+            ascending.lines.is_empty(),
+            "precondition: the old ascending behaviour starves the lines"
+        );
+
+        let page = present_tail(&lines, &events, tip, &PresentationLimits::default());
+        assert!(
+            !page.lines.is_empty(),
+            "tail must return current lines even when the event history dwarfs them"
+        );
+        let newest = page.lines.last().unwrap().last_seq();
+        assert_eq!(
+            newest, 500_039,
+            "the newest line must survive the cap, not the oldest event"
+        );
+        assert_eq!(
+            page.cursor, tip,
+            "a tail's cursor stays at the tip so a subscriber gets what comes next, \
+             never a replay of what the cap dropped"
+        );
+        assert!(page.truncated, "older records were in fact left out");
+    }
+
+    #[test]
+    fn tail_that_fits_returns_everything_with_the_tip_cursor() {
+        let lines = vec![line(0, b"a"), line(1, b"b")];
+        let events = vec![event(2)];
+        let page = present_tail(&lines, &events, 3, &PresentationLimits::default());
+        assert!(!page.truncated);
+        assert_eq!(page.lines.len(), 2);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.cursor, 3);
+    }
+
+    #[test]
+    fn tail_keeps_a_contiguous_newest_suffix_in_ascending_order() {
+        let lines: Vec<AssembledLine> = (0..50u64)
+            .map(|i| {
+                line(
+                    i,
+                    format!("line number {i} with some padding text").as_bytes(),
+                )
+            })
+            .collect();
+        let tight = PresentationLimits {
+            max_result_bytes: 400,
+            ..PresentationLimits::default()
+        };
+        let page = present_tail(&lines, &[], 50, &tight);
+        assert!(page.truncated);
+        assert!(page.lines.len() < 50, "{}", page.lines.len());
+        // Still oldest-to-newest within the page, and a contiguous suffix:
+        // it ends at the newest line and every seq below it is consecutive.
+        let seqs: Vec<u64> = page.lines.iter().map(|l| l.last_seq()).collect();
+        assert_eq!(*seqs.last().unwrap(), 49);
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        assert_eq!(seqs.len() as u64, 49 - seqs[0] + 1, "{seqs:?}");
+    }
+
+    #[test]
+    fn tail_always_returns_at_least_one_item_even_under_an_impossible_cap() {
+        // Distinct content, so nothing folds into a single item and the cap
+        // is genuinely forced to choose between separate items.
+        let lines: Vec<AssembledLine> = (0..5u64)
+            .map(|i| {
+                line(
+                    i,
+                    format!("line {i}, far larger than the cap allows").as_bytes(),
+                )
+            })
+            .collect();
+        let impossible = PresentationLimits {
+            max_result_bytes: 1,
+            ..PresentationLimits::default()
+        };
+        let page = present_tail(&lines, &[], 5, &impossible);
+        assert_eq!(page.lines.len(), 1);
+        assert_eq!(page.lines[0].last_seq(), 4, "the survivor is the newest");
+        assert!(page.truncated);
     }
 
     // ---- cursor equivalence: paginated reads must match one whole read ----
