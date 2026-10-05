@@ -33,31 +33,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the serialwrapd daemon (see TASKS.md T1.1-T1.4).
+    /// Run the daemon that owns the serial ports and records them.
     Daemon,
-    /// Run the MCP stdio bridge (see TASKS.md T3.1).
+    /// Run the MCP stdio bridge, for AI agents.
     Mcp,
-    /// List known devices (see TASKS.md T1.5).
+    /// List known devices.
     Devices,
-    /// Tail a device's record stream (see TASKS.md T1.5).
+    /// Tail a device's record stream.
     Tail(cli::tail::TailArgs),
-    /// Write bytes to a device, subject to the write gate (see TASKS.md T2.1).
+    /// Write bytes to a device, subject to the write gate.
     Write(cli::write::WriteArgs),
-    /// Take a temporary lease and run an external command against the device
-    /// (see TASKS.md T2.2).
+    /// Take a temporary lease and run an external command (e.g. a flashing
+    /// tool) against the device.
     Run(cli::run::RunArgs),
-    /// Read or update per-device configuration (see TASKS.md T2.3).
+    /// Read or update per-device configuration.
     Config(cli::config::ConfigArgs),
-    /// List, kick, or demote connected clients (see TASKS.md T2.3).
+    /// List, kick, or demote connected clients.
     Clients(cli::clients::ClientsArgs),
-    /// Export recorded data as jsonl/txt/bin (see TASKS.md T2.4).
+    /// Export recorded data as jsonl/txt/bin.
     Export(cli::export::ExportArgs),
-    /// Query the audit view over the record stream (see TASKS.md T4.3).
+    /// Query the audit view over the record stream.
     Audit(cli::audit::AuditArgs),
-    /// List, approve, or deny pending write approvals (see TASKS.md T4.2).
+    /// List, approve, or deny pending write approvals.
     Approvals(cli::approvals::ApprovalsArgs),
     /// Install or uninstall the launchd/systemd user service that runs
-    /// `serialwrap daemon` in the background (see TASKS.md T6.1).
+    /// `serialwrap daemon` in the background.
     Service(cli::service::ServiceArgs),
 }
 

@@ -131,7 +131,7 @@ session 已經自動驗過的部分」與「仍需要人在真實環境跑一次
   安裝相依套件 → `rustup` 裝 Rust → Node 22 → `npm run build`（前端）→ `cargo
   build --release` → `cargo test --all`（364+ 個測試，mock-device 全流程）→ 啟動
   daemon → 透過 CLI `tail` 在螢幕上看到 log 行，總計 **~135 秒**（遠低於 15
-  分鐘門檻）。完整指令序列與逐段計時見 PR 說明；`packaging/linux/install.sh`
+  分鐘門檻）。完整指令序列與逐段計時見 PR 說明；`packaging/linux/install.sh`（現已移至 repo 根目錄 `install.sh`）
   單獨用同一個 base image 重跑一次，66 秒完成（複用已裝好 Rust/Node 的 base
   image，故比上面全流程數字快，公平比較應看上面含 apt/rustup/node 安裝的
   135 秒）。
