@@ -30,16 +30,39 @@ export interface DaemonHandle {
   stop(): Promise<void>;
 }
 
-// Known limitation (deferred, not fixed here): auto-allocated ports are a
-// fixed, incrementing sequence rather than OS-assigned ephemeral ports. If
-// a previous run's daemon were ever orphaned (e.g. the process survived a
-// hard test-runner kill) it could still be holding one of these ports,
-// causing the next run's `startDaemon()` to fail its health check against
-// the wrong (stale) daemon. `workers: 1` plus each daemon's own throwaway
-// HOME dir makes this unlikely in practice; escalate to real OS-assigned
-// ports (bind `0`, read back the actual port) if this is ever observed
-// flaking in CI — same category of fix as issue #39.
+// Auto-allocated ports are an incrementing sequence, skipping any port
+// something else already holds (see `allocatePort`). That skip was added
+// after a developer machine with an SSH tunnel on 15590 made the first
+// daemon's health check pass against the tunnel's remote daemon. The
+// remaining gap: a port can still be taken between the probe and the
+// daemon's own bind; `workers: 1` plus each daemon's own throwaway HOME
+// dir keeps that unlikely. Escalate to real OS-assigned ports (bind `0`,
+// read back the actual port) if it is ever observed — same category of
+// fix as issue #39.
 let nextPort = 15590;
+
+/** True when nothing is listening on `127.0.0.1:port` right now. */
+function portIsFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.listen(port, "127.0.0.1", () => probe.close(() => resolve(true)));
+  });
+}
+
+/**
+ * The next port in the sequence that nothing else already holds. Without
+ * this check, a port taken by some unrelated listener (an SSH tunnel
+ * forwarding to another machine's real daemon, say) makes `waitForHealthy`
+ * succeed against *that* server, and every test in the file then talks to
+ * the wrong daemon.
+ */
+async function allocatePort(): Promise<number> {
+  for (;;) {
+    const port = nextPort++;
+    if (await portIsFree(port)) return port;
+  }
+}
 
 async function waitForHealthy(url: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -111,7 +134,7 @@ function rulesTomlPath(home: string): string {
 
 export async function startDaemon(options?: number | StartDaemonOptions): Promise<DaemonHandle> {
   const opts: StartDaemonOptions = typeof options === "number" ? { port: options } : (options ?? {});
-  const usePort = opts.port ?? nextPort++;
+  const usePort = opts.port ?? (await allocatePort());
   const home = mkdtempSync(path.join(tmpdir(), "serialwrap-e2e-"));
 
   if (opts.rulesToml) {

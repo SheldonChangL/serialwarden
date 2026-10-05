@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 # `cargo deb -p serialwrap` (T6.1, issue #23): Linux packaging alternative
-# to the install script (`packaging/linux/install.sh`). Asset paths are
+# to the install script (`install.sh` at the repo root). Asset paths are
 # resolved relative to this crate's own manifest directory (cargo-deb's own
 # convention), hence the `../../` back to the workspace root for the
 # shared `target/` dir and the udev rule template that lives under
