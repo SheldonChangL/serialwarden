@@ -79,6 +79,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .merge(stream::routes())
         .fallback(assets::serve_asset)
         .with_state(shared)
+        .layer(axum::middleware::from_fn(guard::same_site_only))
         .layer(axum::middleware::from_fn(guard::loopback_only))
 }
 
