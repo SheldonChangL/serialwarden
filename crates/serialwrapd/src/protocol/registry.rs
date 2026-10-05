@@ -87,7 +87,7 @@ impl QueryRegistry {
             .map(|p| p.line_terminator)
             .unwrap_or(LineTerminatorMode::Auto);
         let state = Arc::new(DeviceQueryState::with_line_terminator(line_terminator));
-        state.ingest(&recorder);
+        state.ingest_to_tip(&recorder);
         let handle = spawn_poller(recorder, Arc::clone(&state), self.poll_interval);
         states.insert(id.clone(), (Arc::clone(&state), handle));
         state
