@@ -106,7 +106,9 @@ jobs:
 
       - name: Package tarball
         run: |
-          tag="${GITHUB_REF_NAME:-dev}"
+          # A dry run from a branch like docs/x would otherwise put a "/"
+          # in the file name and package into a subdirectory.
+          tag=$(printf '%s' "${GITHUB_REF_NAME:-dev}" | tr '/' '-')
           name="serialwrap-${tag}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/serialwrap" "dist/${name}/serialwrap"
@@ -173,7 +175,9 @@ jobs:
 
       - name: Package tarball
         run: |
-          tag="${GITHUB_REF_NAME:-dev}"
+          # A dry run from a branch like docs/x would otherwise put a "/"
+          # in the file name and package into a subdirectory.
+          tag=$(printf '%s' "${GITHUB_REF_NAME:-dev}" | tr '/' '-')
           name="serialwrap-${tag}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           cp target/release/serialwrap "dist/${name}/serialwrap"
