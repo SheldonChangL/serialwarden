@@ -638,7 +638,11 @@ impl DeviceQueryState {
     /// every `tail`/`read_since` reply from then on. Serializing the whole
     /// operation makes the loser of the race observe the winner's cursor and
     /// find nothing new, which is the correct outcome.
-    pub fn ingest(&self, recorder: &Recorder) {
+    ///
+    /// Returns whether this call consumed any records — i.e. whether there
+    /// may be more behind them, since one call reads at most
+    /// [`MAX_INGEST_BYTES`]. See [`Self::ingest_to_tip`].
+    pub fn ingest(&self, recorder: &Recorder) -> bool {
         let mut recorder_cursor = self
             .recorder_cursor
             .lock()
@@ -663,19 +667,19 @@ impl DeviceQueryState {
                     }
                     Err(e) => {
                         eprintln!("serialwrapd: query: ingest retry after DataAgedOut failed: {e}");
-                        return;
+                        return false;
                     }
                 }
             }
             Err(ReadSinceError::Io(e)) => {
                 eprintln!("serialwrapd: query: ingest read_since failed: {e}");
-                return;
+                return false;
             }
         };
 
         if page.records.is_empty() {
             *recorder_cursor = page.next_cursor;
-            return;
+            return false;
         }
 
         {
@@ -811,6 +815,24 @@ impl DeviceQueryState {
         if added {
             self.notify.notify_waiters();
         }
+        true
+    }
+
+    /// [`Self::ingest`] repeatedly until the recorder has nothing more to
+    /// hand over, so this state reflects the device's current output rather
+    /// than wherever one bounded read happened to stop.
+    ///
+    /// A single `ingest` on a fresh state starts from the recorder's oldest
+    /// segment and stops after [`MAX_INGEST_BYTES`]. On a device with
+    /// hundreds of MB of history that is weeks-old data, so the first `tail`
+    /// served from it returned those old lines with a cursor pointing just
+    /// past them — and the web GUI, subscribing from that cursor, then
+    /// replayed the entire remaining history 8KB per push before reaching
+    /// anything current. Catching up first is the same work the poller
+    /// would do over its next few ticks anyway; it just finishes before the
+    /// first reply instead of after it.
+    pub fn ingest_to_tip(&self, recorder: &Recorder) {
+        while self.ingest(recorder) {}
     }
 
     /// Last `n` lines (after `filter`) and the out-of-band events from the
@@ -1214,6 +1236,38 @@ mod tests {
 
     fn recorder(tmp: &std::path::Path) -> Recorder {
         Recorder::open(tmp, "dev", RecorderConfig::default()).expect("open recorder")
+    }
+
+    /// A history larger than one ingest's [`MAX_INGEST_BYTES`] must still
+    /// leave `ingest_to_tip` at the newest record, so the first `tail` on a
+    /// long-lived device is current output, not its oldest segment.
+    #[test]
+    fn ingest_to_tip_catches_up_past_one_bounded_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let mut chunk = vec![b'x'; 48 * 1024 - 1];
+        chunk.push(b'\n');
+        // 48KB raw is ~64KB of base64 per record; this overshoots one
+        // ingest's budget by a few records.
+        let records = MAX_INGEST_BYTES / (64 * 1024) + 8;
+        for _ in 0..records {
+            recorder.append_rx(&chunk).unwrap();
+        }
+        let last = recorder.append_rx(b"newest line\n").unwrap();
+
+        let bounded = DeviceQueryState::new();
+        bounded.ingest(&recorder);
+        assert_ne!(
+            bounded.tail(1, None).unwrap().lines[0].text,
+            "newest line",
+            "precondition: one ingest must not reach the tip, or this test proves nothing"
+        );
+
+        let state = DeviceQueryState::new();
+        state.ingest_to_tip(&recorder);
+        let page = state.tail(1, None).unwrap();
+        assert_eq!(page.lines[0].text, "newest line");
+        assert_eq!(page.cursor, last.seq() + 1);
     }
 
     #[test]
