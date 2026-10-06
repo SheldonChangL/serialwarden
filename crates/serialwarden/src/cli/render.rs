@@ -90,6 +90,25 @@ fn render_data_content(bytes: &[u8]) -> String {
         // after confirming `bytes` is valid UTF-8.
         return String::from_utf8_lossy(bytes).into_owned();
     }
+    // A write payload is the exact bytes sent, so unlike an assembled `rx`
+    // line (the assembler strips the terminator) it usually ends in `\r`
+    // and/or `\n` — "ATS?\r" is a command, not binary. Line terminators
+    // are the one control character a terminal handles harmlessly *and* the
+    // one a human expects at the end of a command, so they must not decide
+    // text-vs-binary. They are shown escaped (never raw, which would break
+    // the one-record-per-row layout) so the row still says what was sent.
+    let body_len = bytes
+        .iter()
+        .rposition(|b| !matches!(b, b'\r' | b'\n'))
+        .map_or(0, |i| i + 1);
+    let (body, terminators) = bytes.split_at(body_len);
+    if !terminators.is_empty() && is_terminal_safe(body) {
+        let mut text = String::from_utf8_lossy(body).into_owned();
+        for t in terminators {
+            text.push_str(if *t == b'\r' { "\\r" } else { "\\n" });
+        }
+        return text;
+    }
     let preview: Vec<String> = bytes
         .iter()
         .take(HEX_PREVIEW_BYTES)
@@ -347,6 +366,57 @@ mod tests {
             hex_section.split_whitespace().all(|h| h == "ff"),
             "hex section was: {hex_section:?}"
         );
+    }
+
+    #[test]
+    fn trailing_line_terminators_do_not_make_a_command_binary() {
+        // The demo regression: a TX of "ATS?\r" rendered as
+        // "[5 bytes binary — 41 54 53 3f 0d]".
+        assert_eq!(render_data_content(b"ATS?\r"), "ATS?\\r");
+        assert_eq!(render_data_content(b"status\r\n"), "status\\r\\n");
+        assert_eq!(render_data_content(b"status\n"), "status\\n");
+        assert_eq!(render_data_content(b"\r"), "\\r");
+    }
+
+    #[test]
+    fn a_control_byte_before_the_terminator_still_means_binary() {
+        // Only the *trailing* run is exempt: ESC mid-payload can reprogram
+        // the terminal, and invalid UTF-8 is binary whatever follows it.
+        let rendered = render_data_content(b"a\x1bb\r");
+        assert!(
+            rendered.contains("4 bytes binary"),
+            "rendered was: {rendered}"
+        );
+        assert!(!rendered.contains('\x1b'), "rendered was: {rendered:?}");
+        let rendered = render_data_content(&[0xFF, 0xFE, b'\r']);
+        assert!(
+            rendered.contains("3 bytes binary"),
+            "rendered was: {rendered}"
+        );
+        assert!(rendered.contains("ff fe 0d"), "rendered was: {rendered}");
+        // A terminator in the middle is not trailing either.
+        let rendered = render_data_content(b"a\rb");
+        assert!(
+            rendered.contains("3 bytes binary"),
+            "rendered was: {rendered}"
+        );
+    }
+
+    #[test]
+    fn tx_record_with_a_cr_terminated_command_renders_as_text() {
+        let record = serde_json::json!({
+            "kind": "tx",
+            "client": "agent:1",
+            "client_type": "agent",
+            "gate": "human_rw",
+            "data_b64": BASE64.encode(b"ATS?\r"),
+        });
+        let rendered = render_event_line("2026-07-27T10:34:12.443+08:00", &record);
+        assert!(
+            rendered.ends_with("gate=human_rw ATS?\\r"),
+            "rendered was: {rendered}"
+        );
+        assert!(!rendered.contains("binary"), "rendered was: {rendered}");
     }
 
     #[test]

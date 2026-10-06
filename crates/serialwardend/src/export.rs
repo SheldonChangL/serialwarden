@@ -398,12 +398,35 @@ fn hex_preview(bytes: &[u8]) -> String {
     }
 }
 
+/// A tx payload is the exact bytes written, so it usually ends in `\r`
+/// and/or `\n` ("ATS?\r"); that is a command, not binary. When everything
+/// before the trailing run of line terminators is plain text, render it with
+/// the terminators escaped (a raw one would split the row). `None` when the
+/// payload has no trailing terminator or its body is not plain text.
+fn text_with_escaped_terminators(bytes: &[u8]) -> Option<String> {
+    let body_len = bytes
+        .iter()
+        .rposition(|b| !matches!(b, b'\r' | b'\n'))
+        .map_or(0, |i| i + 1);
+    let (body, terminators) = bytes.split_at(body_len);
+    if terminators.is_empty() || !is_plain_text(body) {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(body).into_owned();
+    for t in terminators {
+        text.push_str(if *t == b'\r' { "\\r" } else { "\\n" });
+    }
+    Some(text)
+}
+
 /// Render one rx/tx payload's content for a `txt` row: plain lossy text
 /// when it's safe to show as-is, otherwise a `[N bytes binary] <hex>`
 /// annotation — the wiki's own literal example shape.
 fn render_content(bytes: &[u8]) -> String {
     if is_plain_text(bytes) {
         String::from_utf8_lossy(bytes).into_owned()
+    } else if let Some(text) = text_with_escaped_terminators(bytes) {
+        text
     } else {
         format!("[{} bytes binary] {}", bytes.len(), hex_preview(bytes))
     }
@@ -788,6 +811,17 @@ mod tests {
         assert!(!text.contains("drop me"), "text: {text}");
         assert!(text.contains("tx client=human"), "text: {text}");
         assert!(text.contains("disconnect"), "text: {text}");
+    }
+
+    #[test]
+    fn txt_export_renders_a_cr_terminated_tx_as_text_not_binary() {
+        assert_eq!(render_content(b"ATS?\r"), "ATS?\\r");
+        assert_eq!(render_content(b"status\r\n"), "status\\r\\n");
+        // Only a trailing terminator is exempt; mid-payload control bytes
+        // and invalid UTF-8 are still binary.
+        assert!(render_content(b"a\x1bb\r").contains("bytes binary"));
+        assert!(render_content(&[0xFF, b'\r']).contains("bytes binary"));
+        assert!(render_content(b"a\rb").contains("bytes binary"));
     }
 
     // ---- --from/--to wall-clock bounds ----
