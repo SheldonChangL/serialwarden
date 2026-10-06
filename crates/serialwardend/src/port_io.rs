@@ -122,37 +122,71 @@ pub fn plan_open_sequence(open_control_lines: OpenControlLines) -> Vec<PortOp> {
     ops
 }
 
+/// A port [`open_and_configure`] opened, and how each configuration step
+/// went, kept apart because they are different facts: a board whose
+/// adapter has no modem lines can refuse DTR/RTS while running the
+/// requested baud and framing perfectly well, and the record of that open
+/// must not say the baud failed (or the reverse).
+#[derive(Debug)]
+pub struct OpenedPort {
+    pub file: File,
+    /// Applying baud/framing ([`PortOp::ApplyTermios`]). An error means the
+    /// port is not known to be running `config`'s line settings.
+    pub termios: io::Result<()>,
+    /// The first failure asserting DTR/RTS ([`OpenControlLines::Assert`]
+    /// only; never set in `Preserve` mode, which touches no lines).
+    pub control_lines: Option<io::Error>,
+    /// Failure clearing `O_NONBLOCK`. Not a configuration fact: reads still
+    /// work through the reader's `poll()` loop either way.
+    pub nonblocking: Option<io::Error>,
+}
+
 /// Open `path` and apply `config`, mechanically following exactly
 /// [`plan_open_sequence`]'s plan for `config.open_control_lines` — the
 /// plan *is* what runs, so there is no way for this executor to silently
 /// diverge from what the plan (and its tests) say it does.
 ///
-/// Returns the open file plus, if any *non-open* step failed, the first
-/// such error. See the module docs for why that error is not folded into
-/// the outer `Result`.
-pub fn open_and_configure(
+/// Only failing to open is an `Err`; every later step's outcome is reported
+/// separately in [`OpenedPort`]. See the module docs for why.
+pub fn open_and_configure(path: &Path, config: &PortConfig) -> io::Result<OpenedPort> {
+    open_and_configure_with(path, config, &apply_termios, &set_control_line)
+}
+
+/// [`open_and_configure`], with the termios and control-line steps supplied
+/// by the caller. `port.rs` passes its own (normally exactly
+/// [`apply_termios`]/[`set_control_line`]) so tests can make a step fail the
+/// way real drivers do, which no PTY can.
+pub fn open_and_configure_with(
     path: &Path,
     config: &PortConfig,
-) -> io::Result<(File, Option<io::Error>)> {
+    apply_termios: &dyn Fn(RawFd, &PortConfig) -> io::Result<()>,
+    set_control_line: &dyn Fn(RawFd, ControlLine, bool) -> io::Result<()>,
+) -> io::Result<OpenedPort> {
     let file = open_nonblocking(path)?;
     let fd = file.as_raw_fd();
-    let mut first_err: Option<io::Error> = None;
+    let mut termios = Ok(());
+    let mut control_lines = None;
+    let mut nonblocking = None;
 
     for op in plan_open_sequence(config.open_control_lines) {
-        let result = match op {
-            PortOp::OpenNonblocking => Ok(()), // already done above; open() itself is a hard failure
-            PortOp::ApplyTermios => apply_termios(fd, config),
-            PortOp::SetControlLine { line, level } => set_control_line(fd, line, level),
-            PortOp::ClearNonblocking => clear_nonblocking(fd),
-        };
-        if let Err(e) = result {
-            if first_err.is_none() {
-                first_err = Some(e);
+        match op {
+            PortOp::OpenNonblocking => {} // already done above; open() itself is a hard failure
+            PortOp::ApplyTermios => termios = apply_termios(fd, config),
+            PortOp::SetControlLine { line, level } => {
+                if let Err(e) = set_control_line(fd, line, level) {
+                    control_lines.get_or_insert(e);
+                }
             }
+            PortOp::ClearNonblocking => nonblocking = clear_nonblocking(fd).err(),
         }
     }
 
-    Ok((file, first_err))
+    Ok(OpenedPort {
+        file,
+        termios,
+        control_lines,
+        nonblocking,
+    })
 }
 
 fn open_nonblocking(path: &Path) -> io::Result<File> {
@@ -321,6 +355,42 @@ pub fn dtr_pulse(fd: RawFd, duration: Duration) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused DTR/RTS must not be reported as a refused baud: the two
+    /// outcomes come back separately.
+    #[test]
+    fn a_control_line_failure_is_reported_apart_from_the_termios_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake-port");
+        std::fs::write(&path, b"").unwrap();
+        let config = PortConfig {
+            open_control_lines: OpenControlLines::Assert {
+                dtr: true,
+                rts: false,
+            },
+            ..PortConfig::default()
+        };
+        let opened = open_and_configure_with(&path, &config, &|_, _| Ok(()), &|_, _, _| {
+            Err(io::Error::from_raw_os_error(libc::ENOTTY))
+        })
+        .unwrap();
+        assert!(opened.termios.is_ok());
+        let err = opened.control_lines.expect("the DTR/RTS failure");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTTY));
+
+        let opened = open_and_configure_with(
+            &path,
+            &config,
+            &|_, _| Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            &|_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            opened.termios.unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert!(opened.control_lines.is_none());
+    }
 
     // ---- Acceptance criterion 2: the ioctl call *sequence* is what's
     // testable without hardware; DTR/RTS electrical behavior isn't. ----
