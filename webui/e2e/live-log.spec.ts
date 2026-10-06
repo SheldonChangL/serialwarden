@@ -269,6 +269,93 @@ test("scrolling up pauses following; the pill count is correct; clicking it retu
   await expect(pill).toHaveCount(0);
 });
 
+test("keyboard scrolling up (Home) pauses following", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  await injectLog(
+    daemon!,
+    DEVICE_ID,
+    rxLines(Array.from({ length: 80 }, (_, i) => `line ${i}`)),
+  );
+  const viewport = page.getByTestId("log-viewport");
+  await expect(viewport).toHaveAttribute("data-following", "true", { timeout: 10_000 });
+  await expect(page.getByTestId("log-row").last()).toContainText("line 79", { timeout: 10_000 });
+
+  // Click inside the log (focuses the scroller, as a user would), then use
+  // the keyboard. Home is a user-initiated scroll away from the tail.
+  await viewport.click({ position: { x: 20, y: 40 } });
+  await page.keyboard.press("Home");
+  await expect(viewport).toHaveAttribute("data-following", "false", { timeout: 5_000 });
+  await expect(page.getByTestId("paused-indicator")).toBeVisible();
+});
+
+test("the approval card appearing and collapsing never pauses following when nobody scrolled", async ({
+  page,
+}) => {
+  await gotoConnectedLiveLog(page);
+
+  await injectLog(
+    daemon!,
+    DEVICE_ID,
+    rxLines(Array.from({ length: 80 }, (_, i) => `line ${i}`)),
+  );
+  const viewport = page.getByTestId("log-viewport");
+  await expect(viewport).toHaveAttribute("data-following", "true", { timeout: 10_000 });
+  await expect(page.getByTestId("log-row").last()).toContainText("line 79", { timeout: 10_000 });
+
+  // Record every moment `data-following` goes false, so a *transient* pause
+  // (which a later re-pin could hide from a one-shot assertion) still fails
+  // the test. Nobody touches the scroll in this test: a pause is a bug.
+  await viewport.evaluate((el) => {
+    const w = window as unknown as { __pauses: number };
+    w.__pauses = 0;
+    new MutationObserver(() => {
+      if (el.getAttribute("data-following") === "false") w.__pauses++;
+    }).observe(el, { attributes: true, attributeFilter: ["data-following"] });
+  });
+  const pauses = () => page.evaluate(() => (window as unknown as { __pauses: number }).__pauses);
+
+  // An agent's write needs approval: the card mounts above the log and the
+  // log container resizes under it. (Same test-only endpoint as
+  // `approval-card.spec.ts`'s `submitPendingWrite`.)
+  const submitted = await page.request.post(
+    `${daemon!.url}/api/devices/${DEVICE_ID}/test/submit_write`,
+    { data: { requester_name: "claude-code", requester_pid: 4242, text: "custom_cmd" } },
+  );
+  expect(submitted.ok()).toBe(true);
+  expect(((await submitted.json()) as { decision: string }).decision).toBe("pending");
+  const card = page.getByTestId("approval-card");
+  await expect(card).toBeVisible({ timeout: 3_000 });
+
+  // The request's own gate row ("Awaiting approval") is now the newest row.
+  const request = page.locator('[data-row-kind="gate"][data-gate-action="request"]');
+  await expect(request).toHaveCount(1, { timeout: 10_000 });
+  await expect(request).toBeInViewport();
+  await expect(viewport).toHaveAttribute("data-following", "true");
+  await expect(page.getByTestId("paused-indicator")).toHaveCount(0);
+
+  await injectLog(
+    daemon!,
+    DEVICE_ID,
+    rxLines(Array.from({ length: 20 }, (_, i) => `after request ${i}`)),
+  );
+  await expect(page.getByTestId("log-row").last()).toContainText("after request 19", {
+    timeout: 10_000,
+  });
+  await expect(page.getByTestId("log-row").last()).toBeInViewport();
+
+  // Deny: the card collapses (the log grows back) and the decision row lands.
+  await card.getByTestId("approval-deny").click();
+  await expect(card).toHaveCount(0, { timeout: 5_000 });
+  const deny = page.locator('[data-row-kind="gate"][data-gate-action="deny"]');
+  await expect(deny).toHaveCount(1, { timeout: 10_000 });
+  await expect(deny.locator(".label")).toHaveText("Blocked");
+  await expect(deny).toBeInViewport();
+  await expect(viewport).toHaveAttribute("data-following", "true");
+  await expect(page.getByTestId("paused-indicator")).toHaveCount(0);
+  await expect(page.getByTestId("resume-following-pill")).toHaveCount(0);
+  expect(await pauses()).toBe(0);
+});
+
 test("DOM node count does not grow linearly with total lines received (virtual scroll)", async ({
   page,
 }) => {
