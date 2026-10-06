@@ -177,7 +177,7 @@ sudo usermod -aG dialout "$USER"
 # then log out and back in — group membership doesn't apply to your current session
 ```
 
-Some minimal or hardened setups lack the distro's generic USB-serial udev rule. If `serialwarden devices` still can't see your adapter after the group change, install the rule template. `install.sh` puts it in `~/.local/share/serialwarden/`; it is also in this repo:
+Some minimal or hardened setups lack the distro's generic USB-serial udev rule. If `serialwarden devices` still can't see your adapter after the group change, install the rule template. `install.sh` puts it in `~/.local/share/doc/serialwarden/`; it is also in this repo:
 
 ```sh
 sudo cp packaging/linux/60-serialwarden.rules /etc/udev/rules.d/
