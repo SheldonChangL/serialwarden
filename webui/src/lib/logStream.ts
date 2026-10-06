@@ -76,6 +76,12 @@ export interface DecodeHealth {
   /** When the newest sampled bytes were recorded — set even when they
    * never formed a complete line. */
   newest_sample_t_wall?: string | null;
+  /** The port's state as recorded events tell it — a baud trial uses it to
+   * tell "went quiet" from "went away". */
+  port?: "unknown" | "open" | "disconnected" | "leased";
+  /** `connect` events seen in this connection-scoped evidence; a change
+   * means the device reconnected. */
+  connects?: number;
   suggested_baud: number | null;
   suggestion?: BaudSuggestion | null;
 }

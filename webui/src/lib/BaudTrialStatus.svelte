@@ -28,7 +28,7 @@
   }
   const { deviceId, testid, class: className = "", onChanged }: Props = $props();
 
-  let view = $state<TrialView>({ running: null, outcome: null, next: null });
+  let view = $state<TrialView>({ running: null, outcome: null, next: null, busy: false });
   let unsubscribe: (() => void) | undefined;
   $effect(() => {
     unsubscribe?.();
@@ -53,8 +53,13 @@
   <div class={className} role="status" data-testid={testid} data-state={view.outcome.kind}>
     <span>{describeOutcome(view.outcome)}</span>
     {#if view.outcome.kind === "unconfirmed"}
-      <button type="button" data-testid="{testid}-switch-back" onclick={() => void switchBack(deviceId, deps)}>
-        Switch back to {view.outcome.previous}
+      <button
+        type="button"
+        data-testid="{testid}-switch-back"
+        disabled={view.busy}
+        onclick={() => void switchBack(deviceId, deps)}
+      >
+        {view.busy ? "Switching back…" : `Switch back to ${view.outcome.previous}`}
       </button>
     {/if}
     {#if view.next !== null}
@@ -62,7 +67,13 @@
         Try {view.next} next
       </button>
     {/if}
-    <button type="button" class="dismiss" data-testid="{testid}-dismiss" onclick={() => dismissTrial(deviceId)}>
+    <button
+      type="button"
+      class="dismiss"
+      data-testid="{testid}-dismiss"
+      disabled={view.busy}
+      onclick={() => dismissTrial(deviceId)}
+    >
       Dismiss
     </button>
   </div>

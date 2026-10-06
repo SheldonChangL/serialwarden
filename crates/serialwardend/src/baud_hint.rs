@@ -213,9 +213,29 @@ pub struct DecodeHealth {
     /// `t_wall` of the newest sampled chunk — lets the GUI tell a live
     /// garbled stream from a stale one even when no complete line arrived.
     pub newest_sample_t_wall: Option<String>,
+    /// What the recorded events say about the port right now — lets a
+    /// baud trial tell "the device went quiet" from "the device went away".
+    pub port: PortState,
+    /// How many `connect` events this connection-scoped evidence has seen;
+    /// a change mid-trial means the device reconnected.
+    pub connects: u64,
     /// `suggestion.baud`, kept as its own field for existing clients.
     pub suggested_baud: Option<u32>,
     pub suggestion: Option<BaudSuggestion>,
+}
+
+/// The port's state as the recorded events tell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PortState {
+    /// No `connect`/`disconnect`/`lease_*` event seen yet.
+    #[default]
+    Unknown,
+    Open,
+    Disconnected,
+    /// A `lease_start` without its `lease_end`: a tool (often a flasher) has
+    /// the port.
+    Leased,
 }
 
 /// One raw `rx` record's bytes, as kept by [`EvidenceTracker`].
@@ -261,6 +281,10 @@ pub struct EvidenceTracker {
     /// The newest fingerprint seen since the last connect.
     fingerprint: Option<&'static Fingerprint>,
     recent: VecDeque<RecentRxChunk>,
+    /// Sum of `recent`'s byte lengths, kept as it changes.
+    recent_bytes: usize,
+    port: PortState,
+    connects: u64,
 }
 
 /// A rate out of a `config_change` event's `old`/`new` value: the full
@@ -315,7 +339,14 @@ impl EvidenceTracker {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         match name {
-            "connect" => self.reset(seq, None),
+            "connect" => {
+                self.reset(seq, None);
+                self.port = PortState::Open;
+                self.connects += 1;
+            }
+            "disconnect" => self.port = PortState::Disconnected,
+            "lease_start" => self.port = PortState::Leased,
+            "lease_end" if self.port == PortState::Leased => self.port = PortState::Unknown,
             "config_change" => {
                 let new = baud_of(extra.get("new"));
                 if extra.get("changed_by").and_then(|v| v.as_str()) == Some("system:connect") {
@@ -355,12 +386,12 @@ impl EvidenceTracker {
             t_wall: t_wall.to_string(),
             bytes: bytes[keep_from..].to_vec(),
         });
-        let mut total: usize = self.recent.iter().map(|c| c.bytes.len()).sum();
+        self.recent_bytes += bytes.len() - keep_from;
         while let Some(front) = self.recent.front() {
-            if total - front.bytes.len() < RECENT_RX_BYTES {
+            if self.recent_bytes - front.bytes.len() < RECENT_RX_BYTES {
                 break;
             }
-            total -= front.bytes.len();
+            self.recent_bytes -= front.bytes.len();
             self.recent.pop_front();
         }
     }
@@ -435,6 +466,24 @@ pub fn classify_bytes(bytes: &[u8]) -> (usize, usize) {
         rest = &rest[valid.len() + bad_len..];
     }
     (non_text, neutral)
+}
+
+/// A run of at least [`MIN_SAMPLE_BYTES`] that is mostly neutral bytes
+/// (at least half) with almost no text in it (under a quarter): what
+/// reading far faster than the device sends looks like — each low bit
+/// arrives as a break, so the stream is NULs. Neutral bytes only stay
+/// neutral mixed into text (a progress counter, NUL padding after a line);
+/// on their own they are the garbage.
+fn neutral_garble(bytes: &[u8]) -> bool {
+    let (non_text, neutral) = classify_bytes(bytes);
+    let text = bytes.len() - non_text - neutral;
+    bytes.len() >= MIN_SAMPLE_BYTES && neutral * 2 >= bytes.len() && text * 4 < bytes.len()
+}
+
+/// Whether NUL is most of `bytes` — the specific signature of reading
+/// faster than the device sends.
+fn mostly_nul(bytes: &[u8]) -> bool {
+    bytes.iter().filter(|&&b| b == 0).count() * 2 >= bytes.len()
 }
 
 /// `non_text / (len - neutral)`, or `0.0` when nothing counts.
@@ -605,19 +654,35 @@ pub fn infer(configured: u32, evidence: &EvidenceTracker) -> DecodeHealth {
         .iter()
         .flat_map(|c| c.bytes.iter().copied())
         .collect();
-    let (undecodable_ratio, counted) = non_text_ratio(&sample);
     let (text_lines, last_text_end) = text_profile(&sample);
+    // With no readable line, a mostly-neutral sample is garbage, and every
+    // non-text byte (neutral ones included) is reported as undecodable.
+    let sample_neutral_garble = text_lines == 0 && neutral_garble(&sample);
+    let (undecodable_ratio, counted) = if sample_neutral_garble {
+        let (non_text, neutral) = classify_bytes(&sample);
+        (
+            (non_text + neutral) as f64 / sample.len() as f64,
+            sample.len(),
+        )
+    } else {
+        non_text_ratio(&sample)
+    };
     // What arrived after the last readable line: "now".
     let trailing = &sample[last_text_end..];
     let (trailing_ratio, trailing_counted) = non_text_ratio(trailing);
-    let no_text_now = trailing_counted >= MIN_SAMPLE_BYTES
-        && trailing_ratio >= NO_TEXT_NOW_RATIO
-        && trailing.len() as f64 >= sample.len() as f64 * NO_TEXT_NOW_MIN_SHARE;
+    let trailing_garbled = (trailing_counted >= MIN_SAMPLE_BYTES
+        && trailing_ratio >= NO_TEXT_NOW_RATIO)
+        || neutral_garble(trailing);
+    let no_text_now =
+        trailing_garbled && trailing.len() as f64 >= sample.len() as f64 * NO_TEXT_NOW_MIN_SHARE;
+    let too_fast = no_text_now && mostly_nul(trailing);
     let mut health = DecodeHealth {
         checked_bytes: sample.len(),
         undecodable_ratio,
         text_lines,
         newest_sample_t_wall: chunks.last().map(|c| c.t_wall.clone()),
+        port: evidence.port,
+        connects: evidence.connects,
         ..DecodeHealth::default()
     };
     let garbled = counted >= MIN_SAMPLE_BYTES && undecodable_ratio >= UNDECODABLE_THRESHOLD;
@@ -634,12 +699,16 @@ pub fn infer(configured: u32, evidence: &EvidenceTracker) -> DecodeHealth {
         .last_readable_t_mono
         .get(&current)
         .is_some_and(|&t| newest_t.is_none_or(|now| now - t <= MODE_SWITCH_WINDOW_S));
+    // NULs mean reading faster than the device sends, which is the
+    // opposite of a switch into a faster mode.
     let mode_switch = no_text_now
+        && !too_fast
         && recently_readable_here
         && history.readable_lines.get(&current).copied().unwrap_or(0) >= READABLE_LINES_FOR_HISTORY;
     health.suggestion = suggest(
         current,
         no_text_now,
+        too_fast,
         mode_switch,
         &history,
         evidence.fingerprint,
@@ -658,6 +727,7 @@ struct Candidate {
 fn suggest(
     current: u32,
     no_text_now: bool,
+    too_fast: bool,
     mode_switch: bool,
     history: &History,
     fingerprint: Option<&'static Fingerprint>,
@@ -741,7 +811,18 @@ fn suggest(
                 explanation: fingerprint_sentence(f),
             });
         }
-        if no_text_now {
+        if too_fast {
+            for &b in RATES_ASCENDING.iter().rev().filter(|&&b| b < current) {
+                candidates.push(Candidate {
+                    baud: b,
+                    basis: Basis::Direction,
+                    fingerprint: None,
+                    explanation: format!(
+                        "What arrives now is mostly NUL bytes, which is how a stream read far                          faster than it is sent looks. Slower rates are tried first, so {b} is                          next — an order to try in, not a reading off these bytes."
+                    ),
+                });
+            }
+        } else if no_text_now {
             for &b in RATES_ASCENDING.iter().filter(|&&b| b > current) {
                 candidates.push(Candidate {
                     baud: b,
@@ -1238,6 +1319,63 @@ mod tests {
         let health = sim.health(115_200);
         assert_eq!(health.undecodable_ratio, 0.0, "{health:?}");
         assert_eq!(health.suggestion, None);
+
+        // Even when the window holds nothing but the counter (no line):
+        // half its bytes are text, so it isn't mistaken for a NUL stream.
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        for pct in 0..60 {
+            sim.bytes(format!("{pct:3}%\x08\x08\x08\x08").as_bytes());
+        }
+        assert_eq!(sim.health(115_200).suggestion, None);
+    }
+
+    /// Re-review item A: reading at 10x+ the device's rate yields NULs.
+    #[test]
+    fn an_all_nul_stream_warns_and_suggests_slower_rates() {
+        let mut sim = Sim::new();
+        sim.connect(1_500_000);
+        sim.bytes(&[0u8; 200]);
+        let health = sim.health(1_500_000);
+        assert_eq!(health.undecodable_ratio, 1.0, "{health:?}");
+        let s = health.suggestion.expect("suggestion");
+        assert_eq!(s.basis, Basis::Direction);
+        assert_eq!(s.baud, 921_600);
+        assert!(!s.mode_switch);
+        assert!(s.explanation.contains("NUL"), "{}", s.explanation);
+    }
+
+    #[test]
+    fn a_mostly_nul_stream_with_a_few_stray_bytes_warns_too() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        let mut bytes = vec![0u8; 150];
+        for i in (0..150).step_by(10) {
+            bytes[i] = if i % 20 == 0 { 0x80 } else { b'x' };
+        }
+        sim.bytes(&bytes);
+        let s = sim.suggestion(115_200);
+        assert!(s.baud < 115_200, "suggested {}", s.baud);
+    }
+
+    /// The scenario that found it: an unconfirmed trial left the port at
+    /// 1500000, the board reset to its 115200 console, and the log filled
+    /// with NULs.
+    #[test]
+    fn nuls_after_a_fast_trial_suggest_the_rate_the_console_was_readable_at() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        for t in ISSUE_TEXT {
+            sim.text(t);
+        }
+        sim.texts(10);
+        sim.garbage(5);
+        sim.change(115_200, 1_500_000, true);
+        sim.garbage(5);
+        sim.bytes(&[0u8; 400]);
+        let s = sim.suggestion(1_500_000);
+        assert_eq!(s.baud, 115_200);
+        assert_eq!(s.basis, Basis::History);
     }
 
     #[test]
@@ -1349,6 +1487,37 @@ mod tests {
             assert!(!f.reason.is_empty() && !f.reason.ends_with('.'));
             assert!(!f.platform.is_empty());
         }
+    }
+
+    #[test]
+    fn port_state_follows_connect_disconnect_and_lease_events() {
+        let mut sim = Sim::new();
+        assert_eq!(sim.health(9600).port, PortState::Unknown);
+        sim.connect(9600);
+        let h = sim.health(9600);
+        assert_eq!((h.port, h.connects), (PortState::Open, 1));
+        sim.tracker.on_event(90, "lease_start", &Map::new());
+        assert_eq!(sim.health(9600).port, PortState::Leased);
+        sim.tracker.on_event(91, "lease_end", &Map::new());
+        sim.tracker.on_event(92, "disconnect", &Map::new());
+        assert_eq!(sim.health(9600).port, PortState::Disconnected);
+        sim.connect(9600);
+        let h = sim.health(9600);
+        assert_eq!((h.port, h.connects), (PortState::Open, 2));
+    }
+
+    #[test]
+    fn the_recent_window_stays_bounded_with_a_running_total() {
+        let mut tracker = EvidenceTracker::default();
+        for i in 0..100 {
+            tracker.on_rx(i, 0.0, "", &[0x41; 1000]);
+        }
+        let total: usize = tracker.recent.iter().map(|c| c.bytes.len()).sum();
+        assert_eq!(total, tracker.recent_bytes);
+        assert!(
+            (RECENT_RX_BYTES..RECENT_RX_BYTES + 1000).contains(&total),
+            "{total}"
+        );
     }
 
     #[test]

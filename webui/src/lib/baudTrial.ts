@@ -12,10 +12,15 @@
  *   "Didn't help" is only said when bytes arrived and still didn't decode;
  *   silence is reported as "couldn't be judged".
  * - **Binary expected** (a chip fingerprint, or the device appears to have
- *   switched modes): download traffic is binary even at the right rate, and
- *   a ROM waiting for its host is often silent, so decoding cannot confirm
- *   or reject the rate. Clean text still confirms it; anything else leaves
- *   the rate applied and says it is unconfirmed, with a one-click way back.
+ *   switched modes): a download protocol is binary even at the right rate,
+ *   a device in some other non-text mode may be too, and either may stay
+ *   silent until spoken to, so decoding cannot confirm or reject the rate.
+ *   Clean text still confirms it; anything else leaves the rate applied
+ *   and says it is unconfirmed, with a one-click way back.
+ * - **The device went away** (disconnect, a lease handing the port to a
+ *   tool such as a flasher, or a reconnect) mid-trial: said plainly, and
+ *   the previous rate is put back so the next open doesn't use an untested
+ *   one.
  *
  * The measurement comes from the daemon: after a rate change, `GET
  * /api/devices/:id/config`'s `decode_health` samples only bytes recorded
@@ -49,6 +54,9 @@ export const TRIAL_EARLY_KEEP_BYTES = 128;
 export const TRIAL_EARLY_STOP_BYTES = 512;
 /** The daemon's own warning threshold. */
 export const TRIAL_GARBLED_RATIO = 0.2;
+/** No single request may hold the trial (and with it the unload guard and
+ * the per-device lock) longer than this. */
+export const TRIAL_REQUEST_TIMEOUT_MS = 4_000;
 
 export interface TrialSample {
   checked_bytes: number;
@@ -87,7 +95,17 @@ export type TrialOutcome =
   | { kind: "kept"; baud: number; baseline: TrialSample; sample: TrialSample }
   | { kind: "reverted"; baud: number; previous: number; baseline: TrialSample; sample: TrialSample }
   /** Binary expected: stayed at `baud`, which decoding couldn't confirm. */
-  | { kind: "unconfirmed"; baud: number; previous: number; sample: TrialSample }
+  | { kind: "unconfirmed"; baud: number; previous: number; sample: TrialSample; why: BinaryReason }
+  /** The device disconnected, was leased to a tool, or reconnected during
+   * the trial. `restored` says whether the previous rate was put back. */
+  | {
+      kind: "interrupted";
+      baud: number;
+      previous: number;
+      cause: "disconnected" | "leased" | "reconnected";
+      restored: boolean;
+      restoreError?: string;
+    }
   | { kind: "switched_back"; baud: number; previous: number }
   /** Another client changed the rate mid-trial; nothing was reverted. */
   | { kind: "superseded"; baud: number; observed: number }
@@ -97,15 +115,18 @@ export type TrialOutcome =
   | { kind: "not_applied"; baud: number; previous: number; reason: string; restoreError?: string }
   | { kind: "failed"; baud: number; message: string };
 
+export type BinaryReason = "fingerprint" | "mode_switch";
+
 export interface TrialPlan {
   candidate: number;
   /** Further candidates, in order, offered after a trial that didn't end
    * on a working rate. */
   alternatives: number[];
   baseline: TrialSample;
-  /** The suggestion's basis is a fingerprint, or the device appears to
-   * have switched modes: download traffic, binary even at the right rate. */
-  expectsBinary: boolean;
+  /** Why the right rate may still not decode: a chip fingerprint (its
+   * download protocol is binary), or the device appears to have switched
+   * modes (into something that isn't text). `null`: text is expected. */
+  binary: BinaryReason | null;
   /** Whether the device appears to have switched modes — carried to the
    * alternatives, which have no fingerprint of their own. */
   modeSwitch: boolean;
@@ -120,7 +141,7 @@ export function planFromHealth(health: DecodeHealth): TrialPlan | null {
     candidate,
     alternatives: s?.alternatives ?? [],
     baseline: { checked_bytes: health.checked_bytes, undecodable_ratio: health.undecodable_ratio },
-    expectsBinary: s ? s.basis === "fingerprint" || s.mode_switch : false,
+    binary: s?.basis === "fingerprint" ? "fingerprint" : s?.mode_switch ? "mode_switch" : null,
     modeSwitch: s?.mode_switch ?? false,
   };
 }
@@ -150,6 +171,33 @@ function sampleOf(health: DecodeHealth | undefined): TrialSample {
 
 const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/** `promise`, or a rejection after `ms` — a hung request must not hold the
+ * trial open. */
+function withTimeout<T>(promise: Promise<T>, ms: number = TRIAL_REQUEST_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no answer within ${ms / 1000} s`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** `deps` with every request bounded by [`TRIAL_REQUEST_TIMEOUT_MS`]. */
+function bounded(deps: TrialDeps): TrialDeps {
+  return {
+    ...deps,
+    fetchConfig: (id) => withTimeout(deps.fetchConfig(id)),
+    setConfig: (id, patch) => withTimeout(deps.setConfig(id, patch)),
+  };
+}
+
 function notAppliedReason(result: SetConfigResult): string {
   if (result.apply === "not_connected") return "the port isn't open";
   return result.apply_error ?? "the port refused it";
@@ -164,10 +212,14 @@ export async function runBaudTrial(
   onProgress?: (sample: TrialSample, elapsedMs: number) => void,
   windowMs: number = TRIAL_WINDOW_MS,
 ): Promise<TrialOutcome> {
+  deps = bounded(deps);
   const candidate = plan.candidate;
   let previous: number;
+  let connects: number | undefined;
   try {
-    previous = Number((await deps.fetchConfig(deviceId)).config.baud);
+    const before = await deps.fetchConfig(deviceId);
+    previous = Number(before.config.baud);
+    connects = before.decode_health?.connects;
   } catch (e) {
     return { kind: "failed", baud: candidate, message: errorText(e) };
   }
@@ -202,7 +254,29 @@ export async function runBaudTrial(
       const full = await deps.fetchConfig(deviceId);
       const observed = Number(full.config.baud);
       if (observed !== candidate) return { kind: "superseded", baud: candidate, observed };
-      sample = sampleOf(full.decode_health);
+      const health = full.decode_health;
+      const cause =
+        health?.port === "disconnected"
+          ? "disconnected"
+          : health?.port === "leased"
+            ? "leased"
+            : connects !== undefined && health?.connects !== undefined && health.connects !== connects
+              ? "reconnected"
+              : null;
+      if (cause !== null) {
+        return revertTo(deviceId, candidate, previous, deps, (prev) => ({
+          kind: "interrupted",
+          baud: candidate,
+          previous: prev,
+          cause,
+          restored: true,
+        })).then((o) =>
+          o.kind === "failed"
+            ? { kind: "interrupted", baud: candidate, previous, cause, restored: false, restoreError: o.message }
+            : o,
+        );
+      }
+      sample = sampleOf(health);
       onProgress?.(sample, elapsed);
     } catch {
       // A failed poll is no evidence; the window still ends on time.
@@ -210,7 +284,7 @@ export async function runBaudTrial(
     const verdict = judgeTrial(plan.baseline, sample, elapsed, windowMs);
     if (verdict === "wait") continue;
     if (verdict === "keep") return { kind: "kept", baud: candidate, baseline: plan.baseline, sample };
-    if (plan.expectsBinary) return { kind: "unconfirmed", baud: candidate, previous, sample };
+    if (plan.binary !== null) return { kind: "unconfirmed", baud: candidate, previous, sample, why: plan.binary };
     return revertTo(deviceId, candidate, previous, deps, (prev) => ({
       kind: "reverted",
       baud: candidate,
@@ -267,15 +341,34 @@ export function describeOutcome(outcome: TrialOutcome, windowMs: number = TRIAL_
         `bytes still failed to decode — so it was switched back to ${outcome.previous}.`
       );
     case "unconfirmed": {
-      const heard =
-        outcome.sample.checked_bytes < TRIAL_MIN_BYTES
-          ? `nothing arrived within ${secs} s, and a ROM in download mode often waits silently for its host`
-          : `${outcome.sample.checked_bytes} bytes arrived, ${pct(outcome.sample.undecodable_ratio)}% not text, ` +
-            `and download traffic is binary even at the right rate`;
+      const fingerprint = outcome.why === "fingerprint";
+      const silent = outcome.sample.checked_bytes < TRIAL_MIN_BYTES;
+      const heard = silent
+        ? `nothing arrived within ${secs} s, and ` +
+          (fingerprint
+            ? "a ROM in download mode often waits silently for its host"
+            : "a device in a mode that isn't text may stay silent until spoken to")
+        : `${outcome.sample.checked_bytes} bytes arrived, ${pct(outcome.sample.undecodable_ratio)}% not text, and ` +
+          (fingerprint
+            ? "download traffic is binary even at the right rate"
+            : "the device may be in a mode that isn't text");
+      const check = fingerprint ? "Check with the flashing tool" : "Check what the device is doing";
       return (
         `Staying at ${outcome.baud}, unconfirmed: ${heard}, so decoding can't tell. ` +
-        `Check with the flashing tool, or switch back to ${outcome.previous}.`
+        `${check}, or switch back to ${outcome.previous}.`
       );
+    }
+    case "interrupted": {
+      const what =
+        outcome.cause === "disconnected"
+          ? "The device disconnected during the trial"
+          : outcome.cause === "leased"
+            ? "A tool (such as a flasher) took the port during the trial"
+            : "The device reconnected during the trial";
+      return outcome.restored
+        ? `${what}, so ${outcome.baud} couldn't be judged. The saved rate was set back to ${outcome.previous}.`
+        : `${what}, so ${outcome.baud} couldn't be judged, and setting the rate back to ${outcome.previous} ` +
+            `failed: ${outcome.restoreError}`;
     }
     case "switched_back":
       return `Switched back from ${outcome.baud} to ${outcome.previous}.`;
@@ -305,6 +398,9 @@ export interface TrialView {
   /** The next candidate to offer, when the last trial didn't end on a
    * working rate. */
   next: number | null;
+  /** A follow-up (switching back) is in flight: its buttons are disabled
+   * and a second click is ignored. */
+  busy: boolean;
 }
 
 interface DeviceTrial {
@@ -317,7 +413,7 @@ interface DeviceTrial {
 
 const trials = new Map<string, DeviceTrial>();
 const listeners = new Map<string, Set<(view: TrialView) => void>>();
-const EMPTY: TrialView = { running: null, outcome: null, next: null };
+const EMPTY: TrialView = { running: null, outcome: null, next: null, busy: false };
 
 function guardUnload(e: BeforeUnloadEvent): void {
   e.preventDefault();
@@ -327,7 +423,7 @@ function guardUnload(e: BeforeUnloadEvent): void {
 
 function syncUnloadGuard(): void {
   if (typeof window === "undefined") return;
-  const anyRunning = [...trials.values()].some((t) => t.view.running !== null);
+  const anyRunning = [...trials.values()].some((t) => t.view.running !== null || t.view.busy);
   window.removeEventListener("beforeunload", guardUnload);
   if (anyRunning) window.addEventListener("beforeunload", guardUnload);
 }
@@ -353,21 +449,26 @@ export function subscribeTrial(deviceId: string, cb: (view: TrialView) => void):
 }
 
 function nextAfter(outcome: TrialOutcome, remaining: number[]): number | null {
-  const ended = outcome.kind === "reverted" || outcome.kind === "not_applied" || outcome.kind === "switched_back";
+  const ended =
+    outcome.kind === "reverted" ||
+    outcome.kind === "not_applied" ||
+    outcome.kind === "switched_back" ||
+    (outcome.kind === "interrupted" && outcome.restored);
   return ended ? (remaining[0] ?? null) : null;
 }
 
 async function run(deviceId: string, trial: DeviceTrial, plan: TrialPlan, deps: TrialDeps): Promise<void> {
-  publish(deviceId, { running: plan.candidate, outcome: null, next: null });
+  publish(deviceId, { running: plan.candidate, outcome: null, next: null, busy: false });
   const outcome = await runBaudTrial(deviceId, plan, deps);
   trial.remaining = plan.alternatives.filter((b) => b !== plan.candidate);
-  publish(deviceId, { running: null, outcome, next: nextAfter(outcome, trial.remaining) });
+  publish(deviceId, { running: null, outcome, next: nextAfter(outcome, trial.remaining), busy: false });
 }
 
 /** Start trying `plan.candidate` on `deviceId`, unless a trial is already
  * running there. */
 export async function startTrial(deviceId: string, plan: TrialPlan, deps: TrialDeps): Promise<void> {
-  if (trials.get(deviceId)?.view.running != null) return;
+  const existing = trials.get(deviceId)?.view;
+  if (existing && (existing.running !== null || existing.busy)) return;
   const trial: DeviceTrial = {
     view: EMPTY,
     remaining: plan.alternatives,
@@ -382,32 +483,38 @@ export async function startTrial(deviceId: string, plan: TrialPlan, deps: TrialD
 export async function tryNext(deviceId: string, deps: TrialDeps): Promise<void> {
   const trial = trials.get(deviceId);
   const candidate = trial?.view.next;
-  if (!trial || candidate == null || trial.view.running !== null) return;
-  await run(deviceId, trial, {
-    candidate,
-    alternatives: trial.remaining.slice(1),
-    baseline: trial.baseline,
-    expectsBinary: trial.modeSwitch,
-    modeSwitch: trial.modeSwitch,
-  }, deps);
+  if (!trial || candidate == null || trial.view.running !== null || trial.view.busy) return;
+  await run(
+    deviceId,
+    trial,
+    {
+      candidate,
+      alternatives: trial.remaining.slice(1),
+      baseline: trial.baseline,
+      binary: trial.modeSwitch ? "mode_switch" : null,
+      modeSwitch: trial.modeSwitch,
+    },
+    deps,
+  );
 }
 
 /** After an unconfirmed trial: go back to the rate before it. */
 export async function switchBack(deviceId: string, deps: TrialDeps): Promise<void> {
   const trial = trials.get(deviceId);
   const outcome = trial?.view.outcome;
-  if (!trial || outcome?.kind !== "unconfirmed" || trial.view.running !== null) return;
-  publish(deviceId, { running: null, outcome, next: null });
-  const result = await revertTo(deviceId, outcome.baud, outcome.previous, deps, (previous) => ({
+  if (!trial || outcome?.kind !== "unconfirmed" || trial.view.running !== null || trial.view.busy) return;
+  publish(deviceId, { running: null, outcome, next: null, busy: true });
+  const result = await revertTo(deviceId, outcome.baud, outcome.previous, bounded(deps), (previous) => ({
     kind: "switched_back",
     baud: outcome.baud,
     previous,
   }));
-  publish(deviceId, { running: null, outcome: result, next: nextAfter(result, trial.remaining) });
+  publish(deviceId, { running: null, outcome: result, next: nextAfter(result, trial.remaining), busy: false });
 }
 
 export function dismissTrial(deviceId: string): void {
-  if (trials.get(deviceId)?.view.running != null) return;
+  const view = trials.get(deviceId)?.view;
+  if (view && (view.running !== null || view.busy)) return;
   trials.delete(deviceId);
   publish(deviceId, EMPTY);
 }

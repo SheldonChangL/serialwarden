@@ -378,7 +378,9 @@ test("a fingerprint trial that hears binary stays at the rate, unconfirmed, with
   expect(await currentBaud()).toBe(1_500_000);
   expect(posts).toEqual([{ baud: 1_500_000 }]);
 
-  await page.getByTestId("baud-trial-status-switch-back").click();
+  // A double click switches back once: one more POST, and no false
+  // "another client changed it" from the second click racing the first.
+  await page.getByTestId("baud-trial-status-switch-back").dblclick();
   await expect(status).toHaveAttribute("data-state", "switched_back", { timeout: 10_000 });
   expect(await currentBaud()).toBe(original);
   expect(posts).toEqual([{ baud: 1_500_000 }, { baud: original }]);
@@ -400,6 +402,45 @@ test("a fingerprint trial that hears nothing stays unconfirmed instead of callin
   await expect(status).toContainText("waits silently for its host");
   expect(posts).toEqual([{ baud: 1_500_000 }]);
 });
+
+test("a mode-switch trial without a fingerprint doesn't claim download traffic", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  await injectLog(daemon!, DEVICE_ID, [
+    ...rxLines(Array.from({ length: 8 }, (_, i) => `[app] heartbeat tick ${i}`)),
+    ...downloadModeOps(4),
+  ]);
+
+  await openPopoverAndTry(page, 19_200);
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "unconfirmed", { timeout: 15_000 });
+  await expect(status).toContainText("a mode that isn't text");
+  await expect(status).not.toContainText("download");
+  await expect(status).not.toContainText("flashing tool");
+});
+
+for (const [name, event, says] of [
+  ["disconnects", "disconnect", "The device disconnected during the trial"],
+  ["is leased to a tool", "lease_start", "A tool (such as a flasher) took the port during the trial"],
+] as const) {
+  test(`a trial whose device ${name} says so and sets the rate back`, async ({ page }) => {
+    await gotoConnectedLiveLog(page);
+    const original = await currentBaud();
+    await injectRtlModeSwitch();
+    const posts = recordConfigPosts(page);
+
+    await openPopoverAndTry(page, 1_500_000);
+    await expect.poll(currentBaud, { timeout: 10_000 }).toBe(1_500_000);
+    await injectLog(daemon!, DEVICE_ID, [{ kind: "event", name: event }]);
+
+    const status = page.getByTestId("baud-trial-status");
+    await expect(status).toHaveAttribute("data-state", "interrupted", { timeout: 15_000 });
+    await expect(status).toContainText(says);
+    await expect(status).toContainText(`set back to ${original}`);
+    await expect(status).not.toContainText("unconfirmed");
+    expect(await currentBaud()).toBe(original);
+    expect(posts).toEqual([{ baud: 1_500_000 }, { baud: original }]);
+  });
+}
 
 // Direction/common suggestions expect text: kept only if it decodes better.
 
