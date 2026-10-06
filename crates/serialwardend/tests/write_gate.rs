@@ -28,8 +28,6 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use nix::pty::openpty;
-use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -65,11 +63,9 @@ async fn start_test_daemon_with_gate(
 /// slave side as a device's writer and read the master side directly to
 /// prove byte-exactness.
 fn open_raw_pty_pair() -> (File, File) {
-    let pair = openpty(None, None).expect("openpty");
-    let mut attrs = tcgetattr(&pair.slave).expect("tcgetattr");
-    cfmakeraw(&mut attrs);
-    tcsetattr(&pair.slave, SetArg::TCSANOW, &attrs).expect("tcsetattr");
-    (File::from(pair.master), File::from(pair.slave))
+    // Through mock-device, so PTY creation is serialized with every other
+    // PTY this test binary opens (macOS openpty() is not thread-safe).
+    mock_device::raw_pty_pair().expect("raw pty pair")
 }
 
 /// Block (on a blocking-pool thread) until exactly `n` bytes have been read

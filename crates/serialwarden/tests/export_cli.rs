@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use nix::pty::openpty;
 use serde_json::Map as JsonMap;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -163,8 +162,10 @@ async fn bin_export_cli_to_a_pty_stdout_is_refused_not_silently_written() {
     let recorder = populated_recorder(tmp_data.path());
     let daemon = start_daemon_with_device("dev", Arc::new(recorder)).await;
 
-    let pair = openpty(None, None).expect("openpty");
-    let slave = std::fs::File::from(pair.slave);
+    // Through mock-device, so PTY creation is serialized with every other PTY
+    // this test binary opens (macOS openpty() is not thread-safe). The master
+    // stays open until the end of the test.
+    let (_master, slave) = mock_device::raw_pty_pair().expect("raw pty pair");
 
     // Deliberately `.spawn()` + `wait_with_output()`, not `.output()`:
     // tokio's `Command::output()` unconditionally overwrites stdout/stderr

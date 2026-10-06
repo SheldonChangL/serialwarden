@@ -18,8 +18,6 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use nix::pty::openpty;
-use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -979,11 +977,9 @@ async fn subscribe_since_cursor_below_the_retained_floor_is_a_structured_data_ag
 /// a byte-exact assertion needs to see — see the acceptance criteria this
 /// file proves below).
 fn open_raw_pty_pair() -> (File, File) {
-    let pair = openpty(None, None).expect("openpty");
-    let mut attrs = tcgetattr(&pair.slave).expect("tcgetattr");
-    cfmakeraw(&mut attrs);
-    tcsetattr(&pair.slave, SetArg::TCSANOW, &attrs).expect("tcsetattr");
-    (File::from(pair.master), File::from(pair.slave))
+    // Through mock-device, so PTY creation is serialized with every other
+    // PTY this test binary opens (macOS openpty() is not thread-safe).
+    mock_device::raw_pty_pair().expect("raw pty pair")
 }
 
 /// Block (on a blocking-pool thread, so the daemon's own tasks on this same
