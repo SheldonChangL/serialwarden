@@ -275,13 +275,10 @@ async fn get_config(
             // a one-shot `GET` here must not report stale decode health
             // while it waits for that tick.
             state.ingest(&recorder);
-            // Issue #50: inferred from the device's own recorded evidence —
-            // raw recent bytes (so an all-binary stream with no line breaks
-            // still counts), the rate each earlier line was read at, and any
-            // chip banner in that text. See `crate::baud_hint`.
-            let config_changes = state.query_events(&["config_change".to_string()], None, None);
-            let recent = state.recent_rx(None);
-            state.with_lines(|lines| baud_hint::infer(config.baud, &recent, lines, &config_changes))
+            // Issue #50: inferred from the device's own recorded evidence,
+            // folded in by the query layer as records arrive — see
+            // `crate::baud_hint`.
+            state.decode_health(config.baud)
         }
         None => baud_hint::DecodeHealth::default(),
     };

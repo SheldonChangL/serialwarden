@@ -43,7 +43,8 @@
   import { stripAnsi } from "./ansi";
   import { harvest } from "./completion";
   import { formatConfig } from "./eventText";
-  import { describeOutcome, runBaudTrial, trialRunning, type TrialOutcome } from "./baudTrial";
+  import { browserDeps, planFromHealth, startTrial, subscribeTrial } from "./baudTrial";
+  import BaudTrialStatus from "./BaudTrialStatus.svelte";
   import LogRow from "./LogRow.svelte";
   import Timeline from "./Timeline.svelte";
   import PortSettingsPopover from "./PortSettingsPopover.svelte";
@@ -113,10 +114,11 @@
   let streamErrorDetail = $state<string | null>(null);
   let deviceConfig = $state<DeviceConfig | null>(null);
   let recordingSinceLabel = $state<string | null>(null);
-  /** The rate a one-click trial is currently trying (issue #50), and how
-   * the last one ended — see `baudTrial.ts`. */
-  let tryingBaud = $state<number | null>(null);
-  let trialOutcome = $state<TrialOutcome | null>(null);
+  /** Whether a one-click baud trial is running on this device (issue #50)
+   * — the trial itself, and how it ended, live in `baudTrial.ts`, per
+   * device, so they survive this view being remounted. */
+  let trialRunning = $state(false);
+  $effect(() => subscribeTrial(deviceId, (v) => (trialRunning = v.running !== null)));
 
   let popoverOpen = $state(false);
   let configChipEl: HTMLButtonElement | undefined = $state();
@@ -446,9 +448,20 @@
   let resizeObserver: ResizeObserver | undefined;
   let removeIntentListeners: (() => void) | undefined;
   let clockTimer: ReturnType<typeof setInterval> | undefined;
+  let healthTimer: ReturnType<typeof setInterval> | undefined;
+
+  /** The baud warning used to learn about new garbage only when something
+   * else refetched the config (mount, a `config_change`), so a stream that
+   * turned to garbage after the page loaded never raised it. Re-read it
+   * periodically while the tab is visible — `decode_health` is a few KiB of
+   * work for the daemon, which folds its evidence in as records arrive. */
+  const DECODE_HEALTH_REFRESH_MS = 10_000;
 
   onMount(() => {
     clockTimer = setInterval(() => (nowMs = Date.now()), 1_000);
+    healthTimer = setInterval(() => {
+      if (!document.hidden) refreshConfig();
+    }, DECODE_HEALTH_REFRESH_MS);
     viewportHeight = containerEl?.clientHeight ?? 0;
     // The pane's height now tracks the window's, so the virtualizer can't
     // measure once at mount and be done — a resized window would render too
@@ -497,6 +510,7 @@
     resizeObserver?.disconnect();
     removeIntentListeners?.();
     if (clockTimer) clearInterval(clockTimer);
+    if (healthTimer) clearInterval(healthTimer);
     if (highlightTimer) clearTimeout(highlightTimer);
   });
 
@@ -605,32 +619,15 @@
 
   const suggestion = $derived(deviceConfig?.decode_health?.suggestion ?? null);
 
-  /** One-click try with automatic revert (issue #50) — see `baudTrial.ts`.
-   * The outcome sentence stays on screen after the banner itself goes away
-   * (a reverted trial resets the sample, so the warning disappears until
-   * new garbage arrives), because "it was switched back" is exactly the
-   * thing the operator must not miss. */
-  async function trySuggestedBaud(): Promise<void> {
+  /** One-click try (issue #50) — see `baudTrial.ts`. The outcome is shown
+   * by `BaudTrialStatus` below the warning and stays after the warning
+   * itself goes away, because "it was switched back" or "unconfirmed" is
+   * exactly what the operator must not miss. */
+  function trySuggestedBaud(): void {
     const health = deviceConfig?.decode_health;
-    const previous = Number(deviceConfig?.config.baud);
-    if (suggestedBaud === null || !health || Number.isNaN(previous)) return;
-    if (tryingBaud !== null || trialRunning(deviceId)) return;
-    tryingBaud = suggestedBaud;
-    trialOutcome = null;
-    trialOutcome = await runBaudTrial(
-      deviceId,
-      previous,
-      suggestedBaud,
-      { checked_bytes: health.checked_bytes, undecodable_ratio: health.undecodable_ratio },
-      {
-        fetchConfig: fetchDeviceConfig,
-        setConfig: setDeviceConfig,
-        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-        now: () => Date.now(),
-      },
-    );
-    tryingBaud = null;
-    refreshConfig();
+    const plan = health ? planFromHealth(health) : null;
+    if (suggestedBaud === null || plan === null || trialRunning) return;
+    void startTrial(deviceId, plan, browserDeps(fetchDeviceConfig, setDeviceConfig));
   }
 
   /** One consistent clock format for everything in this pane. The footer
@@ -686,7 +683,7 @@
     {/if}
   </div>
 
-  {#if suggestedBaud !== null && tryingBaud === null}
+  {#if suggestedBaud !== null && !trialRunning}
     <!-- The daemon already knew this; it just wasn't saying it anywhere the
          person staring at the garbage would look.
 
@@ -709,13 +706,16 @@
               target="_blank"
               rel="noopener noreferrer">Source</a
             >
+            {#each suggestion.fingerprint.also_see ?? [] as url, i (url)}
+              <a href={url} target="_blank" rel="noopener noreferrer">See also{i > 0 ? ` ${i + 1}` : ""}</a>
+            {/each}
           {/if}
         </span>
       </span>
       <button
         type="button"
         data-testid="baud-warning-apply"
-        title="Switches to this rate, measures for a few seconds, and switches back if it doesn't decode better"
+        title="Switches to this rate and measures what arrives at it for a few seconds"
         onclick={trySuggestedBaud}
       >
         Try {suggestedBaud}
@@ -731,18 +731,7 @@
       </button>
     </div>
   {/if}
-  {#if tryingBaud !== null}
-    <div class="baud-warning" role="status" data-testid="baud-trial-banner" data-state="running">
-      <span>Trying {tryingBaud} — measuring what arrives at it…</span>
-    </div>
-  {:else if trialOutcome}
-    <div class="baud-warning" role="status" data-testid="baud-trial-banner" data-state={trialOutcome.kind}>
-      <span>{describeOutcome(trialOutcome)}</span>
-      <button type="button" class="dismiss" data-testid="baud-trial-dismiss" onclick={() => (trialOutcome = null)}>
-        Dismiss
-      </button>
-    </div>
-  {/if}
+  <BaudTrialStatus {deviceId} testid="baud-trial-banner" class="baud-warning" onChanged={refreshConfig} />
 
   <Timeline
     items={buffer.items}
@@ -947,7 +936,7 @@
     color: var(--text);
   }
 
-  .baud-warning {
+  :global(.baud-warning) {
     display: flex;
     align-items: center;
     gap: var(--space-3);
@@ -959,7 +948,7 @@
     font-size: var(--text-sm);
   }
 
-  .baud-warning button {
+  :global(.baud-warning button) {
     font: inherit;
     font-weight: 600;
     padding: var(--space-1) var(--space-2);
@@ -971,21 +960,21 @@
     flex: none;
   }
 
-  .baud-warning span {
+  :global(.baud-warning span) {
     flex: 1;
     min-width: 12rem;
   }
 
-  .baud-warning .qualifier {
+  :global(.baud-warning .qualifier) {
     color: var(--text-dim);
     font-size: var(--text-xs);
   }
 
-  .baud-warning a {
+  :global(.baud-warning a) {
     color: inherit;
   }
 
-  .baud-warning .dismiss {
+  :global(.baud-warning .dismiss) {
     font-weight: 400;
     border-color: var(--border);
     color: var(--text-dim);

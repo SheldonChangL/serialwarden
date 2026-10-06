@@ -248,7 +248,7 @@ test("a mostly-undecodable rx burst surfaces a baud suggestion in the settings p
   await expect(hint).toBeVisible({ timeout: 10_000 });
   await expect(hint).toContainText("failed to decode");
   await expect(hint).toHaveAttribute("data-basis", "direction");
-  await expect(page.getByTestId("baud-suggestion-explanation")).toContainText("next common rate up");
+  await expect(page.getByTestId("baud-suggestion-explanation")).toContainText("Faster rates are tried first");
   await expect(page.getByTestId("use-suggested-baud")).toBeVisible();
 });
 
@@ -282,8 +282,9 @@ async function currentBaud(): Promise<number> {
   return body.config.baud;
 }
 
-/** Every `POST .../config` body the page sends — a trial sends at most two
- * (the try and the revert), so at most two `config_change` records. */
+/** Every `POST .../config` body the page sends — a trial sends the try and
+ * at most one more (the revert, or restoring the saved setting after the
+ * port refused the rate). */
 function recordConfigPosts(page: Page): Array<Record<string, unknown>> {
   const posts: Array<Record<string, unknown>> = [];
   page.on("request", (req) => {
@@ -294,7 +295,27 @@ function recordConfigPosts(page: Page): Array<Record<string, unknown>> {
   return posts;
 }
 
-test("a recorded chip banner turns the suggestion into that chip's rate, with its source", async ({ page }) => {
+async function decodeHealth(): Promise<{ suggested_baud: number | null; suggestion: { tried_bauds: number[] } | null }> {
+  const res = await fetch(`${daemon!.url}/api/devices/${DEVICE_ID}/config`);
+  return ((await res.json()) as { decode_health: never }).decode_health;
+}
+
+/** Whether leaving the page right now would ask for confirmation. */
+async function unloadGuarded(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const e = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(e);
+    return e.defaultPrevented;
+  });
+}
+
+async function openPopoverAndTry(page: Page, baud: number): Promise<void> {
+  await page.getByTestId("config-chip").click();
+  await expect(page.getByTestId("use-suggested-baud")).toHaveText(`Try ${baud}`, { timeout: 10_000 });
+  await page.getByTestId("use-suggested-baud").click();
+}
+
+test("a recorded chip banner turns the suggestion into that chip's rate, with its sources", async ({ page }) => {
   await gotoConnectedLiveLog(page);
   await injectRtlModeSwitch();
 
@@ -306,31 +327,13 @@ test("a recorded chip banner turns the suggestion into that chip's rate, with it
   const explanation = page.getByTestId("baud-suggestion-explanation");
   await expect(explanation).toContainText("RTL8735B");
   await expect(explanation).toContainText("switched modes");
+  // Says what 1500000 is — a tool default — and what it isn't.
+  await expect(explanation).toContainText("Image Tool");
+  await expect(explanation).toContainText("3000000");
   const source = page.getByTestId("baud-suggestion-source");
   await expect(source).toHaveAttribute("href", REALTEK_SOURCE);
   await expect(source).toHaveAttribute("target", "_blank");
-});
-
-test("trying a suggested baud that doesn't decode better switches back on its own", async ({ page }) => {
-  await gotoConnectedLiveLog(page);
-  const original = await currentBaud();
-  await injectRtlModeSwitch();
-  const posts = recordConfigPosts(page);
-
-  await page.getByTestId("config-chip").click();
-  await page.getByTestId("use-suggested-baud").click();
-  await expect(page.getByTestId("baud-trial-status")).toHaveAttribute("data-state", "running");
-  await expect.poll(currentBaud, { timeout: 10_000 }).toBe(1_500_000);
-  // Still garbage at the new rate, and plenty of it to judge by.
-  await injectLog(daemon!, DEVICE_ID, downloadModeOps(20));
-
-  const status = page.getByTestId("baud-trial-status");
-  await expect(status).toHaveAttribute("data-state", "reverted", { timeout: 15_000 });
-  await expect(status).toContainText("didn't help");
-  await expect(status).toContainText(`switched back to ${original}`);
-  expect(await currentBaud()).toBe(original);
-  // Exactly the two real changes: the try and the revert.
-  expect(posts).toEqual([{ baud: 1_500_000 }, { baud: original }]);
+  await expect(page.getByTestId("baud-suggestion-also-see")).toHaveAttribute("href", /ameba-doc-rtos-pro2-sdk/);
 });
 
 test("the on-screen baud warning states its basis, even for binary with no complete line", async ({ page }) => {
@@ -353,41 +356,153 @@ test("the on-screen baud warning states its basis, even for binary with no compl
   await expect(page.getByTestId("baud-warning-apply")).toHaveText("Try 1500000");
 });
 
-test("a trial that hears nothing at the new rate switches back when its window ends", async ({ page }) => {
+// A fingerprint or mode-switch suggestion expects download traffic: binary
+// even at the right rate, often silent. Decoding can't confirm or reject it.
+
+test("a fingerprint trial that hears binary stays at the rate, unconfirmed, with a way back", async ({ page }) => {
   await gotoConnectedLiveLog(page);
   const original = await currentBaud();
   await injectRtlModeSwitch();
   const posts = recordConfigPosts(page);
 
-  await page.getByTestId("config-chip").click();
-  await page.getByTestId("use-suggested-baud").click();
+  await openPopoverAndTry(page, 1_500_000);
+  await expect.poll(currentBaud, { timeout: 10_000 }).toBe(1_500_000);
+  // What download mode really sends at its rate: binary, no line breaks.
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(20));
 
-  // Silence is not an improvement: after the full measuring window the
-  // trial reverts and says it had nothing to judge.
   const status = page.getByTestId("baud-trial-status");
-  await expect(status).toHaveAttribute("data-state", "reverted", { timeout: 15_000 });
-  await expect(status).toContainText("Nothing to judge arrived at 1500000");
+  await expect(status).toHaveAttribute("data-state", "unconfirmed", { timeout: 15_000 });
+  await expect(status).toContainText("Staying at 1500000, unconfirmed");
+  await expect(status).toContainText("download traffic is binary even at the right rate");
+  await expect(status).not.toContainText("didn't help");
+  expect(await currentBaud()).toBe(1_500_000);
+  expect(posts).toEqual([{ baud: 1_500_000 }]);
+
+  await page.getByTestId("baud-trial-status-switch-back").click();
+  await expect(status).toHaveAttribute("data-state", "switched_back", { timeout: 10_000 });
   expect(await currentBaud()).toBe(original);
   expect(posts).toEqual([{ baud: 1_500_000 }, { baud: original }]);
+  // The next candidate is on offer.
+  await expect(page.getByTestId("baud-trial-status-try-next")).toBeVisible();
 });
 
-test("trying a suggested baud that decodes keeps it", async ({ page }) => {
+test("a fingerprint trial that hears nothing stays unconfirmed instead of calling the rate wrong", async ({
+  page,
+}) => {
   await gotoConnectedLiveLog(page);
   await injectRtlModeSwitch();
   const posts = recordConfigPosts(page);
 
-  await page.getByTestId("config-chip").click();
-  await page.getByTestId("use-suggested-baud").click();
-  await expect.poll(currentBaud, { timeout: 10_000 }).toBe(1_500_000);
-  await injectLog(
-    daemon!,
-    DEVICE_ID,
-    rxLines(Array.from({ length: 6 }, (_, i) => `[ucfg] download ack ${i}, flash write ok`)),
-  );
+  await openPopoverAndTry(page, 1_500_000);
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "unconfirmed", { timeout: 15_000 });
+  await expect(status).toContainText("nothing arrived");
+  await expect(status).toContainText("waits silently for its host");
+  expect(posts).toEqual([{ baud: 1_500_000 }]);
+});
+
+// Direction/common suggestions expect text: kept only if it decodes better.
+
+test("a text-expecting trial that still doesn't decode switches back and offers the next rate", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  const original = await currentBaud();
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(4));
+  const posts = recordConfigPosts(page);
+
+  await openPopoverAndTry(page, 19_200);
+  await expect(page.getByTestId("baud-trial-status")).toHaveAttribute("data-state", "running");
+  await expect.poll(currentBaud, { timeout: 10_000 }).toBe(19_200);
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(20));
+
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "reverted", { timeout: 15_000 });
+  await expect(status).toContainText("didn't help");
+  await expect(status).toContainText(`switched back to ${original}`);
+  expect(await currentBaud()).toBe(original);
+  expect(posts).toEqual([{ baud: 19_200 }, { baud: original }]);
+  await expect(page.getByTestId("baud-trial-status-try-next")).toHaveText("Try 38400 next");
+  // The daemon won't suggest the tried rate again either.
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(4));
+  const health = await decodeHealth();
+  expect(health.suggested_baud).toBe(38_400);
+  expect(health.suggestion?.tried_bauds).toEqual([19_200]);
+});
+
+test("a text-expecting trial that hears nothing says it couldn't judge, then switches back", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  const original = await currentBaud();
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(4));
+  const posts = recordConfigPosts(page);
+
+  await openPopoverAndTry(page, 19_200);
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "reverted", { timeout: 15_000 });
+  await expect(status).toContainText("couldn't be judged");
+  await expect(status).not.toContainText("didn't help");
+  expect(await currentBaud()).toBe(original);
+  expect(posts).toEqual([{ baud: 19_200 }, { baud: original }]);
+});
+
+test("a text-expecting trial that decodes keeps the rate; leaving mid-trial asks first", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(4));
+  const posts = recordConfigPosts(page);
+
+  await openPopoverAndTry(page, 19_200);
+  await expect.poll(currentBaud, { timeout: 10_000 }).toBe(19_200);
+  expect(await unloadGuarded(page)).toBe(true);
+  await injectLog(daemon!, DEVICE_ID, rxLines(Array.from({ length: 6 }, (_, i) => `[app] sensor ${i} ready, 25.3C`)));
 
   const status = page.getByTestId("baud-trial-status");
   await expect(status).toHaveAttribute("data-state", "kept", { timeout: 15_000 });
-  await expect(status).toContainText("Kept 1500000");
-  expect(await currentBaud()).toBe(1_500_000);
-  expect(posts).toEqual([{ baud: 1_500_000 }]);
+  await expect(status).toContainText("Kept 19200");
+  expect(await currentBaud()).toBe(19_200);
+  expect(posts).toEqual([{ baud: 19_200 }]);
+  expect(await unloadGuarded(page)).toBe(false);
 });
+
+test("a trial leaves alone a rate another client changed mid-trial", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(4));
+  const posts = recordConfigPosts(page);
+
+  await openPopoverAndTry(page, 19_200);
+  await expect.poll(currentBaud, { timeout: 10_000 }).toBe(19_200);
+  const other = await fetch(`${daemon!.url}/api/devices/${DEVICE_ID}/config`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ baud: 57_600 }),
+  });
+  expect(other.ok).toBe(true);
+
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "superseded", { timeout: 15_000 });
+  await expect(status).toContainText("Another client changed the rate to 57600");
+  expect(await currentBaud()).toBe(57_600);
+  expect(posts).toEqual([{ baud: 19_200 }]);
+});
+
+test("a trial whose rate the port refuses stops at once and says why", async ({ page }) => {
+  const portError = "Invalid argument (os error 22)";
+  daemon = await startDaemon({ testDeviceId: DEVICE_ID, applyError: portError });
+  await page.goto(daemon.url);
+  await expect(page.getByTestId("connection-dot")).toHaveAttribute("data-state", "open", { timeout: 10_000 });
+  const original = await currentBaud();
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(4));
+  const posts = recordConfigPosts(page);
+
+  await openPopoverAndTry(page, 19_200);
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "not_applied", { timeout: 10_000 });
+  await expect(status).toContainText(`Couldn't apply 19200: ${portError}`);
+  await expect(status).toContainText("Nothing was measured");
+  // The try, then the saved setting put back — nothing measured in between.
+  expect(posts).toEqual([{ baud: 19_200 }, { baud: original }]);
+  expect(await currentBaud()).toBe(original);
+  await expect(page.getByTestId("baud-trial-status-try-next")).toBeVisible();
+  // A rate the port never ran isn't a tested rate.
+  const health = await decodeHealth();
+  expect(health.suggestion?.tried_bauds).toEqual([]);
+  expect(health.suggested_baud).toBe(19_200);
+});
+

@@ -7,7 +7,8 @@
     setDeviceConfig,
     type DeviceConfig,
   } from "./logStream";
-  import { describeOutcome, runBaudTrial, trialRunning, type TrialOutcome } from "./baudTrial";
+  import { browserDeps, planFromHealth, startTrial, subscribeTrial } from "./baudTrial";
+  import BaudTrialStatus from "./BaudTrialStatus.svelte";
 
   interface Props {
     deviceId: string;
@@ -108,7 +109,6 @@
     try {
       const full = await fetchDeviceConfig(deviceId);
       loadFromConfig(full.config);
-      appliedBaud = Number(full.config.baud ?? 9600);
       decodeHealth = full.decode_health;
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
@@ -140,32 +140,19 @@
   }
 
   /** Issue #50: "Try" is an experiment, not just a value copied into the
-   * field — see `baudTrial.ts`. It applies the suggested rate, measures
-   * what arrives at it, and keeps it only if that measurably decodes
-   * better; otherwise it switches back and says so. */
-  let trying = $state<number | null>(null);
-  /** The rate actually applied on the port (not the possibly-edited form
-   * field) — what a failed trial switches back to. */
-  let appliedBaud = $state(9600);
-  let trialOutcome = $state<TrialOutcome | null>(null);
+   * field — see `baudTrial.ts` for what it measures, when it switches back,
+   * and when it can only say "unconfirmed". The trial's state is per
+   * device and shared with the on-screen warning. */
+  let trialRunning = $state(false);
+  $effect(() => subscribeTrial(deviceId, (v) => (trialRunning = v.running !== null)));
 
-  async function trySuggestedBaud(): Promise<void> {
-    const suggested = decodeHealth?.suggested_baud;
-    if (!suggested || trying !== null || trialRunning(deviceId)) return;
-    const previous = appliedBaud;
-    const baseline = {
-      checked_bytes: decodeHealth?.checked_bytes ?? 0,
-      undecodable_ratio: decodeHealth?.undecodable_ratio ?? 0,
-    };
-    trying = suggested;
-    trialOutcome = null;
-    trialOutcome = await runBaudTrial(deviceId, previous, suggested, baseline, {
-      fetchConfig: fetchDeviceConfig,
-      setConfig: setDeviceConfig,
-      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-      now: () => Date.now(),
-    });
-    trying = null;
+  function trySuggestedBaud(): void {
+    const plan = decodeHealth ? planFromHealth(decodeHealth) : null;
+    if (plan === null || trialRunning) return;
+    void startTrial(deviceId, plan, browserDeps(fetchDeviceConfig, setDeviceConfig));
+  }
+
+  async function onTrialChanged(): Promise<void> {
     onApplied();
     await refresh();
   }
@@ -268,7 +255,7 @@
           bind:value={baud}
         />
       </div>
-      {#if decodeHealth?.suggested_baud && trying === null}
+      {#if decodeHealth?.suggested_baud && !trialRunning}
         <p class="hint" data-testid="decode-health-hint" data-basis={decodeHealth.suggestion?.basis}>
           &#9432; {Math.round(decodeHealth.undecodable_ratio * 100)}% of recent output failed to decode — baud may
           be wrong.
@@ -281,27 +268,24 @@
                 target="_blank"
                 rel="noopener noreferrer">Source</a
               >
+              {#each decodeHealth.suggestion.fingerprint.also_see ?? [] as url, i (url)}
+                <a data-testid="baud-suggestion-also-see" href={url} target="_blank" rel="noopener noreferrer"
+                  >See also{i > 0 ? ` ${i + 1}` : ""}</a
+                >
+              {/each}
             {/if}
           {/if}
           <button
             type="button"
             data-testid="use-suggested-baud"
-            title="Switches to this rate, measures for a few seconds, and switches back if it doesn't decode better"
+            title="Switches to this rate and measures what arrives at it for a few seconds"
             onclick={trySuggestedBaud}
           >
             Try {decodeHealth.suggested_baud}
           </button>
         </p>
       {/if}
-      {#if trying !== null}
-        <p class="hint" data-testid="baud-trial-status" data-state="running">
-          Trying {trying} — measuring what arrives at it…
-        </p>
-      {:else if trialOutcome}
-        <p class="hint" data-testid="baud-trial-status" data-state={trialOutcome.kind}>
-          {describeOutcome(trialOutcome)}
-        </p>
-      {/if}
+      <BaudTrialStatus {deviceId} testid="baud-trial-status" class="hint trial" onChanged={onTrialChanged} />
     </section>
 
     <section class="group">
@@ -455,6 +439,23 @@
     color: var(--text-dim);
     margin: 0;
   }
+  :global(.popover .trial) {
+    color: var(--text-dim);
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  :global(.popover .trial button) {
+    font: inherit;
+    border: 1px solid var(--border);
+    background: var(--surface-raised);
+    color: inherit;
+    border-radius: 0.3rem;
+    cursor: pointer;
+  }
+
   .hint a {
     color: inherit;
     margin-left: 0.2rem;

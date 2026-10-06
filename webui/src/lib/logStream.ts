@@ -46,7 +46,18 @@ export interface BaudSuggestion {
    * now is text: "the device appears to have switched modes". */
   mode_switch: boolean;
   readable_bauds: number[];
-  fingerprint: { pattern: string; platform: string; source_url: string; reason: string } | null;
+  /** Rates tried in this connection without a readable line — not offered
+   * again until the device reconnects. */
+  tried_bauds?: number[];
+  /** The next candidates by the same rules, in order. */
+  alternatives?: number[];
+  fingerprint: {
+    pattern: string;
+    platform: string;
+    source_url: string;
+    also_see?: string[];
+    reason: string;
+  } | null;
   /** Plain sentences stating the basis — shown as-is. */
   explanation: string;
 }

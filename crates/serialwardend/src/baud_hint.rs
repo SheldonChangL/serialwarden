@@ -14,47 +14,54 @@
 //! 1. the device had printed clean text at 115200 minutes earlier, so 115200
 //!    was not "the wrong setting" — the device changed modes;
 //! 2. that text named the chip (`RTL8735B_VOE_1.7.1.0`);
-//! 3. nothing at all decoded any more, which is what a stream sent *faster*
-//!    than it is read looks like: bits are lost during sampling, so no
-//!    re-framing of the captured bytes recovers text.
+//! 3. nothing at all decoded any more.
 //!
 //! [`infer`] uses that evidence, in this priority order:
 //!
-//! 1. **History** — which rates this device has produced readable text at.
-//!    If the current rate was readable before and now nothing is, the
-//!    device appears to have switched modes, and the suggestion goes up
-//!    (mode switches into a bootloader/download protocol almost always
-//!    speed up), never back to that rate or below it.
-//! 2. **Fingerprint** — a chip/ROM string from [`FINGERPRINTS`] seen in the
-//!    recorded text maps to that platform's documented rate, carried with
-//!    its source URL so the GUI can show where the number comes from.
-//! 3. **Direction** — with no history or fingerprint and no text at all in
-//!    the sample, the next common rate *above* the current one.
-//! 4. **Common** — otherwise, the next common rate, said to be exactly
-//!    that: a next thing to try, not a reading off these bytes.
+//! 1. **History** — which rates this device has produced readable text at
+//!    *in the current connection*. If the current rate was readable within
+//!    the last [`MODE_SWITCH_WINDOW_S`] and now nothing arriving is text,
+//!    the device appears to have switched modes, and only faster rates are
+//!    offered (a rate the device was readable at first, then a chip
+//!    fingerprint's rate, then the next common rates up) — never that rate
+//!    or one below it.
+//! 2. **Fingerprint** — a chip/ROM string from [`FINGERPRINTS`] seen in this
+//!    connection's text maps to the rate its platform documents, carried
+//!    with its source URL so the GUI shows where the number comes from.
+//! 3. **Direction** — nothing arriving now is text and there is no history
+//!    or fingerprint: faster rates are tried first.
+//! 4. **Common** — otherwise the next common rate, said to be exactly that.
 //!
-//! Every suggestion carries its [`Basis`] and a plain-language
-//! `explanation`, so the GUI states what the guess rests on.
+//! A rate already tried in this connection without producing a readable
+//! line (garbage, binary or silence) is not offered again; the next
+//! candidate is.
+//!
+//! # Where the evidence comes from
+//!
+//! [`EvidenceTracker`] is fed by the query layer's ingest loop
+//! (`crate::query::DeviceQueryState::ingest`) record by record: raw `rx`
+//! bytes, assembled lines, and `connect`/`config_change`/`config_reapplied`
+//! events. It keeps per-rate segments since the last connect plus the newest
+//! [`RECENT_RX_BYTES`] of raw bytes, so a `decode_health` query costs a few
+//! KiB of work no matter how much history the device has, and never holds
+//! the line store's lock.
 //!
 //! # What this does not do
 //!
-//! It never derives a rate from the garbled bytes themselves. When the real
-//! rate is *lower* than the read rate an offline re-framing could in
-//! principle recover it, but when it is higher (the case above) the bits
-//! are gone. The GUI's "try" button closes that gap empirically instead:
-//! it applies the rate, re-measures, and reverts if nothing improved.
+//! It never derives a rate from the garbled bytes themselves. The GUI's
+//! "try" button tests a suggestion empirically instead (`webui/src/lib/baudTrial.ts`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Serialize;
 
-use crate::query::{AssembledLine, OobRecord, RecentRxChunk};
+use crate::query::AssembledLine;
 
 /// One known chip/ROM banner and the rate its platform documents for the
 /// mode that banner implies. To add one: a literal `pattern` that appears
 /// in that platform's own log text, the `baud`, a `source_url` that states
-/// the number, and a short `reason` saying what the number is. No entry
-/// goes in without a source anyone can check.
+/// the number, and a `reason` saying exactly what the number is (and what
+/// it is not). No entry goes in without a source anyone can check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fingerprint {
     /// Case-sensitive substring searched for in recorded text lines.
@@ -63,8 +70,10 @@ pub struct Fingerprint {
     pub platform: &'static str,
     pub baud: u32,
     pub source_url: &'static str,
-    /// What `baud` is, in a sentence fragment ("… at 1500000 baud by
-    /// default"), shown verbatim in the GUI.
+    /// Further pages the `reason` relies on, shown as extra links.
+    pub also_see: &'static [&'static str],
+    /// What `baud` is, as one or two sentences without a final period,
+    /// shown verbatim in the GUI.
     pub reason: &'static str,
 }
 
@@ -75,48 +84,64 @@ pub const FINGERPRINTS: &[Fingerprint] = &[
         platform: "Realtek RTL8735B (AmebaPro2)",
         baud: 1_500_000,
         source_url: "https://aiot.realmcu.com/en/latest/tools/image_tool/index.html",
-        reason: "Realtek's Image Tool downloads firmware at 1500000 baud by default",
+        also_see: &[
+            "https://ameba-doc-rtos-pro2-sdk.readthedocs-hosted.com/en/latest/application_note/04_IMAGE.html",
+        ],
+        reason: "1500000 is the default download rate of Realtek's Image Tool, not a property of \
+                 the chip: the ROM itself announces 115200 in download mode, and the rate after \
+                 that is whatever the host tool's -b option sets (the AmebaPro2 SDK's uartfwburn \
+                 examples use 3000000)",
     },
     Fingerprint {
         pattern: "ets Jan",
         platform: "Espressif ESP8266 boot ROM",
         baud: 74_880,
         source_url: "https://docs.espressif.com/projects/esptool/en/latest/esp8266/advanced-topics/boot-mode-selection.html",
+        also_see: &[],
         reason: "the ESP8266 boot ROM prints its boot log at 74880 baud",
     },
 ];
 
-/// Below this many sampled bytes no suggestion is made — a handful of
-/// bytes is too small for "most of this is undecodable" to mean anything.
+/// Below this many sampled (non-neutral) bytes no suggestion is made.
 pub const MIN_SAMPLE_BYTES: usize = 32;
 
-/// Fraction of non-text bytes at/above which a suggestion is made. Any
-/// real baud mismatch corrupts most bytes almost immediately, while a few
-/// stray binary bytes in otherwise clean text stay well below this.
+/// Fraction of non-text bytes at/above which a suggestion is made.
 pub const UNDECODABLE_THRESHOLD: f64 = 0.2;
 
 /// The bytes after the sample's last readable line count as "no text now"
-/// when there are at least [`MIN_SAMPLE_BYTES`] of them and at least this
-/// fraction is non-text. Higher than [`UNDECODABLE_THRESHOLD`] because it
-/// claims more: not "some garbage", but "the device stopped sending text".
+/// only when they are at least [`MIN_SAMPLE_BYTES`] non-neutral bytes, at
+/// least this fraction of them is non-text, and they are at least
+/// [`NO_TEXT_NOW_MIN_SHARE`] of the sample — a short binary burst after a
+/// screenful of text (a GPS's UBX frame between NMEA sentences) is not
+/// "the device stopped sending text".
 const NO_TEXT_NOW_RATIO: f64 = 0.5;
+const NO_TEXT_NOW_MIN_SHARE: f64 = 0.25;
 
-/// How far back (in raw line bytes, newest first) the history scan walks.
-/// Bounded so a long-lived device's ever-growing in-memory history can't
-/// make every `GET .../config` slower; a few MB covers many boots of a
-/// typical debug console.
-pub const HISTORY_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// How many of the newest raw `rx` bytes are kept for the decode-health
+/// sample. Raw bytes rather than assembled lines: a stream that stopped
+/// being text often stops containing line breaks too, and binary-protocol
+/// framing detection needs every byte.
+pub const RECENT_RX_BYTES: usize = 8 * 1024;
 
-/// A line must have at least this many characters to count as readable
-/// text — short enough for real log lines, long enough that a few bytes of
-/// garbage that happen to be printable don't qualify.
+/// "Readable at this rate before, nothing now" is a mode switch only if the
+/// readable text is this recent (seconds, daemon monotonic clock). Older
+/// than that, a reflash to another rate is as likely as a mode switch.
+pub const MODE_SWITCH_WINDOW_S: f64 = 600.0;
+
+/// A line must have at least this many characters to count as readable.
 const READABLE_LINE_MIN_CHARS: usize = 8;
 
 /// This many readable lines at a rate is what "this device produced
 /// readable text at that rate" means.
 const READABLE_LINES_FOR_HISTORY: usize = 5;
 
-/// Standard rates, ascending — the "next rate up" list.
+/// Per-rate segments kept since the last connect.
+const MAX_SEGMENTS: usize = 64;
+
+/// How many further candidates a suggestion lists after its own rate.
+const MAX_ALTERNATIVES: usize = 3;
+
+/// Standard rates, ascending — the "faster rates first" order.
 const RATES_ASCENDING: &[u32] = &[
     9600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_500_000, 3_000_000,
 ];
@@ -144,6 +169,7 @@ pub struct FingerprintHit {
     pub pattern: &'static str,
     pub platform: &'static str,
     pub source_url: &'static str,
+    pub also_see: &'static [&'static str],
     pub reason: &'static str,
 }
 
@@ -152,13 +178,18 @@ pub struct FingerprintHit {
 pub struct BaudSuggestion {
     pub baud: u32,
     pub basis: Basis,
-    /// The current rate produced readable text earlier and the recent
-    /// sample has none at all — "the device appears to have switched
-    /// modes".
+    /// The current rate produced readable text recently and nothing
+    /// arriving now is text — "the device appears to have switched modes".
     pub mode_switch: bool,
-    /// Rates this device has produced readable text at, within the
-    /// scanned history, ascending.
+    /// Rates this device has produced readable text at in this connection,
+    /// ascending.
     pub readable_bauds: Vec<u32>,
+    /// Rates tried in this connection without a readable line — never
+    /// suggested again until the device reconnects.
+    pub tried_bauds: Vec<u32>,
+    /// The next candidates by the same rules, in order — what to try if
+    /// `baud` doesn't work out.
+    pub alternatives: Vec<u32>,
     pub fingerprint: Option<FingerprintHit>,
     /// One or two plain sentences stating the basis, for display.
     pub explanation: String,
@@ -167,18 +198,17 @@ pub struct BaudSuggestion {
 /// `GET /api/devices/:id/config`'s `decode_health` field.
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
 pub struct DecodeHealth {
-    /// Raw bytes sampled: the newest recorded `rx` bytes since the baud
-    /// rate last changed (at most [`crate::query::RECENT_RX_BYTES`]).
+    /// Raw bytes sampled: the newest recorded `rx` bytes since the rate
+    /// last changed (at most [`RECENT_RX_BYTES`]).
     pub checked_bytes: usize,
-    /// Fraction of `checked_bytes` that isn't text: bytes of invalid UTF-8
-    /// plus control characters other than tab, CR, LF and ESC. `0.0` when
-    /// nothing was sampled.
+    /// Fraction of the sample that isn't text: invalid UTF-8 plus control
+    /// characters, over the sample minus neutral bytes (NUL, BEL, BS, VT,
+    /// FF, SO, SI, DEL — see [`is_neutral`]). `0.0` when nothing counted.
     pub undecodable_ratio: f64,
     /// Readable text lines in the sample (CR/LF-separated).
     pub text_lines: usize,
     /// `Some("slip")` when the sample is structured binary protocol traffic
-    /// — the suggestion is then withheld, since undecodable bytes are what
-    /// that protocol is supposed to look like.
+    /// — the suggestion is then withheld.
     pub binary_protocol: Option<&'static str>,
     /// `t_wall` of the newest sampled chunk — lets the GUI tell a live
     /// garbled stream from a stale one even when no complete line arrived.
@@ -188,12 +218,49 @@ pub struct DecodeHealth {
     pub suggestion: Option<BaudSuggestion>,
 }
 
-/// Baud rate in effect over the recorded stream, rebuilt from
-/// `config_change` events.
-struct BaudTimeline {
-    /// `(seq, old, new)` for every event that actually changed the rate.
-    changes: Vec<(u64, Option<u32>, u32)>,
-    current: u32,
+/// One raw `rx` record's bytes, as kept by [`EvidenceTracker`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentRxChunk {
+    pub seq: u64,
+    pub t_mono: f64,
+    pub t_wall: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A stretch of the stream read at one rate.
+#[derive(Debug, Clone, PartialEq)]
+struct Segment {
+    /// Seq of the event that started it; `None` for the implicit first
+    /// segment, which covers everything from the start of the record.
+    start_seq: Option<u64>,
+    /// `None` until something names the rate (a connect before its
+    /// `config_change`, or a connect whose apply failed).
+    baud: Option<u32>,
+    rx_bytes: usize,
+    readable_lines: usize,
+    last_readable_t_mono: Option<f64>,
+}
+
+impl Segment {
+    fn new(start_seq: Option<u64>, baud: Option<u32>) -> Self {
+        Self {
+            start_seq,
+            baud,
+            rx_bytes: 0,
+            readable_lines: 0,
+            last_readable_t_mono: None,
+        }
+    }
+}
+
+/// Incrementally-built baud evidence for one device — see the module docs.
+#[derive(Debug, Clone, Default)]
+pub struct EvidenceTracker {
+    /// Since the last connect, oldest first; at most [`MAX_SEGMENTS`].
+    segments: VecDeque<Segment>,
+    /// The newest fingerprint seen since the last connect.
+    fingerprint: Option<&'static Fingerprint>,
+    recent: VecDeque<RecentRxChunk>,
 }
 
 /// A rate out of a `config_change` event's `old`/`new` value: the full
@@ -206,55 +273,143 @@ fn baud_of(value: Option<&serde_json::Value>) -> Option<u32> {
     u32::try_from(n).ok()
 }
 
-impl BaudTimeline {
-    fn from_events(events: &[OobRecord], current: u32) -> Self {
-        let mut changes: Vec<(u64, Option<u32>, u32)> = events
-            .iter()
-            .filter(|e| e.name.as_deref() == Some("config_change"))
-            .filter_map(|e| {
-                let new = baud_of(e.extra.get("new"))?;
-                let old = baud_of(e.extra.get("old"));
-                (old != Some(new)).then_some((e.seq, old, new))
-            })
-            .collect();
-        changes.sort_by_key(|c| c.0);
-        Self { changes, current }
-    }
-
-    /// Index of the segment `seq` falls in: `0` before the first change,
-    /// `i` after the `i`th.
-    fn segment_of(&self, seq: u64) -> usize {
-        self.changes.partition_point(|c| c.0 < seq)
-    }
-
-    fn baud_of_segment(&self, segment: usize) -> Option<u32> {
-        if self.changes.is_empty() {
-            return Some(self.current);
+impl EvidenceTracker {
+    fn current_mut(&mut self) -> &mut Segment {
+        if self.segments.is_empty() {
+            self.segments.push_back(Segment::new(None, None));
         }
-        if segment == 0 {
-            self.changes[0].1
-        } else {
-            Some(self.changes[segment - 1].2)
+        self.segments.back_mut().expect("just ensured non-empty")
+    }
+
+    fn reset(&mut self, seq: u64, baud: Option<u32>) {
+        self.segments.clear();
+        self.segments.push_back(Segment::new(Some(seq), baud));
+        self.fingerprint = None;
+    }
+
+    fn switch_to(&mut self, seq: u64, baud: u32) {
+        if self.current_mut().baud == Some(baud) {
+            return;
+        }
+        self.segments.push_back(Segment::new(Some(seq), Some(baud)));
+        while self.segments.len() > MAX_SEGMENTS {
+            self.segments.pop_front();
         }
     }
 
-    fn last_change_seq(&self) -> Option<u64> {
-        self.changes.last().map(|c| c.0)
+    /// An `event` record. `connect` starts a fresh connection; the
+    /// `config_change` every connect writes (`changed_by: "system:connect"`)
+    /// does too, and names its rate. Any other `config_change` or
+    /// `config_reapplied` moves to a new rate only if the port actually
+    /// applied it (`applied` absent is treated as applied, for records
+    /// written before that field existed): a change the port rejected left
+    /// it reading at the old rate, so it is no evidence about the new one.
+    pub fn on_event(
+        &mut self,
+        seq: u64,
+        name: &str,
+        extra: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        let applied = extra
+            .get("applied")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        match name {
+            "connect" => self.reset(seq, None),
+            "config_change" => {
+                let new = baud_of(extra.get("new"));
+                if extra.get("changed_by").and_then(|v| v.as_str()) == Some("system:connect") {
+                    self.reset(seq, new.filter(|_| applied));
+                    return;
+                }
+                if !applied {
+                    return;
+                }
+                let current = self.current_mut();
+                if current.baud.is_none() {
+                    current.baud = baud_of(extra.get("old"));
+                }
+                if let Some(new) = new {
+                    self.switch_to(seq, new);
+                }
+            }
+            "config_reapplied" if applied => {
+                if let Some(baud) = baud_of(extra.get("config")) {
+                    self.switch_to(seq, baud);
+                }
+            }
+            _ => {}
+        }
     }
+
+    /// Raw `rx` bytes, as recorded.
+    pub fn on_rx(&mut self, seq: u64, t_mono: f64, t_wall: &str, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.current_mut().rx_bytes += bytes.len();
+        let keep_from = bytes.len().saturating_sub(RECENT_RX_BYTES);
+        self.recent.push_back(RecentRxChunk {
+            seq,
+            t_mono,
+            t_wall: t_wall.to_string(),
+            bytes: bytes[keep_from..].to_vec(),
+        });
+        let mut total: usize = self.recent.iter().map(|c| c.bytes.len()).sum();
+        while let Some(front) = self.recent.front() {
+            if total - front.bytes.len() < RECENT_RX_BYTES {
+                break;
+            }
+            total -= front.bytes.len();
+            self.recent.pop_front();
+        }
+    }
+
+    /// An assembled line, in the order the query layer completes them.
+    pub fn on_line(&mut self, line: &AssembledLine) {
+        if is_readable_line(&line.raw) {
+            let current = self.current_mut();
+            current.readable_lines += 1;
+            current.last_readable_t_mono = Some(line.t_mono);
+        }
+        // Lossy text: a banner often shares a line with garbage left in
+        // the partial buffer by a mode switch, and an ASCII pattern
+        // survives lossy decoding intact.
+        if let Some(f) = FINGERPRINTS.iter().find(|f| line.text.contains(f.pattern)) {
+            self.fingerprint = Some(f);
+        }
+    }
+
+    /// The newest raw `rx` chunks held, oldest first.
+    pub fn recent(&self) -> Vec<RecentRxChunk> {
+        self.recent.iter().cloned().collect()
+    }
+}
+
+/// Bytes that are neither evidence of text nor of garbage: terminal and
+/// printer controls real consoles emit at the correct rate (a backspace
+/// progress counter, NUL padding, shift-in/out). They are left out of both
+/// sides of the undecodable ratio.
+fn is_neutral(c: char) -> bool {
+    matches!(
+        c,
+        '\0' | '\x07' | '\x08' | '\x0b' | '\x0c' | '\x0e' | '\x0f' | '\x7f'
+    )
 }
 
 fn is_text_char(c: char) -> bool {
     !c.is_control() || matches!(c, '\t' | '\n' | '\r' | '\x1b')
 }
 
-/// Bytes of `bytes` that aren't text: every byte of an invalid UTF-8
-/// sequence (a truncated sequence at the very end counts — nothing more is
-/// coming in a point-in-time sample) plus every control character other
-/// than tab, CR, LF and ESC (ANSI colour). Control characters count because
-/// a mismatched baud produces plenty of them (`0x04`, `0x08`, …) and they
-/// are valid UTF-8, so a UTF-8-only measure understated real garbage.
-pub fn count_non_text_bytes(bytes: &[u8]) -> usize {
+/// `(non_text, neutral)` byte counts for `bytes`. Non-text: every byte of
+/// an invalid UTF-8 sequence (a truncated sequence at the very end counts —
+/// nothing more is coming in a point-in-time sample) plus control
+/// characters other than tab, CR, LF, ESC and the [`is_neutral`] ones.
+/// Control characters count because a mismatched rate produces plenty of
+/// them and they are valid UTF-8.
+pub fn classify_bytes(bytes: &[u8]) -> (usize, usize) {
     let mut non_text = 0usize;
+    let mut neutral = 0usize;
     let mut rest = bytes;
     while !rest.is_empty() {
         let (valid, bad_len) = match std::str::from_utf8(rest) {
@@ -269,27 +424,42 @@ pub fn count_non_text_bytes(bytes: &[u8]) -> usize {
                 )
             }
         };
-        non_text += valid
-            .chars()
-            .filter(|&c| !is_text_char(c))
-            .map(char::len_utf8)
-            .sum::<usize>();
+        for c in valid.chars() {
+            if is_neutral(c) {
+                neutral += 1;
+            } else if !is_text_char(c) {
+                non_text += c.len_utf8();
+            }
+        }
         non_text += bad_len;
         rest = &rest[valid.len() + bad_len..];
     }
-    non_text
+    (non_text, neutral)
+}
+
+/// `non_text / (len - neutral)`, or `0.0` when nothing counts.
+fn non_text_ratio(bytes: &[u8]) -> (f64, usize) {
+    let (non_text, neutral) = classify_bytes(bytes);
+    let counted = bytes.len() - neutral;
+    let ratio = if counted == 0 {
+        0.0
+    } else {
+        non_text as f64 / counted as f64
+    };
+    (ratio, counted)
 }
 
 /// Whether one line (terminator already stripped) is readable text: valid
-/// UTF-8, at least [`READABLE_LINE_MIN_CHARS`] characters once trimmed,
-/// and no control characters other than tab and ESC.
+/// UTF-8, at least [`READABLE_LINE_MIN_CHARS`] characters once neutral
+/// controls are dropped and it is trimmed, and nothing else that isn't text.
 pub fn is_readable_line(raw: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(raw) else {
         return false;
     };
-    let text = text.trim();
-    text.chars().count() >= READABLE_LINE_MIN_CHARS
-        && text
+    let kept: String = text.chars().filter(|&c| !is_neutral(c)).collect();
+    let kept = kept.trim();
+    kept.chars().count() >= READABLE_LINE_MIN_CHARS
+        && kept
             .chars()
             .all(|c| is_text_char(c) && !matches!(c, '\n' | '\r'))
 }
@@ -297,10 +467,10 @@ pub fn is_readable_line(raw: &[u8]) -> bool {
 /// Whether `bytes` is SLIP-framed traffic (RFC 1055) — the structured
 /// binary protocol that must not trigger a baud suggestion. All of:
 ///
+/// - at least [`MIN_SAMPLE_BYTES`] bytes;
 /// - at least 3 complete, non-empty frames between `0xC0` delimiters
 ///   (back-to-back `0xC0`s are empty frames and ignored, as SLIP allows);
-/// - every `0xDB` (ESC) inside a frame is followed by `0xDC` or `0xDD` —
-///   any other escape is invalid SLIP;
+/// - every `0xDB` (ESC) is followed by `0xDC` or `0xDD`;
 /// - regular frame lengths: every complete frame is within a factor of two
 ///   of the median frame length;
 /// - the partial frames before the first and after the last delimiter (the
@@ -309,8 +479,11 @@ pub fn is_readable_line(raw: &[u8]) -> bool {
 ///
 /// A baud mismatch produces `0xC0` about once every 256 bytes with
 /// geometrically distributed gaps and invalid escapes, which fails the
-/// regularity and escape checks; a real SLIP link passes all four.
+/// regularity and escape checks; a real SLIP link passes all of them.
 pub fn looks_like_slip(bytes: &[u8]) -> bool {
+    if bytes.len() < MIN_SAMPLE_BYTES {
+        return false;
+    }
     let delimiters: Vec<usize> = bytes
         .iter()
         .enumerate()
@@ -372,96 +545,59 @@ fn text_profile(sample: &[u8]) -> (usize, usize) {
     (count, last_end)
 }
 
-/// Per-rate readability over the scanned history.
-#[derive(Default)]
+/// What the segments since the last connect say, per rate.
 struct History {
-    /// Readable lines per rate.
     readable_lines: BTreeMap<u32, usize>,
-    /// Rate → seq of its newest readable line.
-    last_readable_seq: BTreeMap<u32, u64>,
-    /// Rates whose most recent segment had enough line bytes, was mostly
-    /// non-text and held no readable line — tried, didn't decode.
-    known_bad: BTreeSet<u32>,
-    fingerprint: Option<&'static Fingerprint>,
+    last_readable_t_mono: BTreeMap<u32, f64>,
+    /// Rate → index of its newest segment holding a readable line.
+    last_readable_segment: BTreeMap<u32, usize>,
+    tried: BTreeSet<u32>,
 }
 
-#[derive(Default)]
-struct SegmentStats {
-    bytes: usize,
-    non_text: usize,
-    readable: usize,
-}
-
-fn scan_history(lines: &[AssembledLine], timeline: &BaudTimeline, current: u32) -> History {
-    let mut history = History::default();
-    let mut segments: BTreeMap<usize, SegmentStats> = BTreeMap::new();
-    let mut scanned = 0usize;
-    for line in lines.iter().rev() {
-        if scanned >= HISTORY_MAX_BYTES {
-            break;
-        }
-        scanned += line.raw.len();
-        let segment = timeline.segment_of(line.seq);
-        let readable = is_readable_line(&line.raw);
-        let stats = segments.entry(segment).or_default();
-        stats.bytes += line.raw.len();
-        stats.non_text += count_non_text_bytes(&line.raw);
-        if readable {
-            stats.readable += 1;
-        }
-        // Matched against the lossy text, not only fully valid lines: a
-        // banner often lands in the same line as garbage left in the
-        // partial buffer by a mode switch, and an ASCII pattern survives
-        // lossy decoding intact (random bytes forming it are negligible).
-        if history.fingerprint.is_none() {
-            history.fingerprint = FINGERPRINTS.iter().find(|f| line.text.contains(f.pattern));
-        }
-        let Some(baud) = timeline.baud_of_segment(segment) else {
+fn summarize(segments: &VecDeque<Segment>, current: u32) -> History {
+    let mut history = History {
+        readable_lines: BTreeMap::new(),
+        last_readable_t_mono: BTreeMap::new(),
+        last_readable_segment: BTreeMap::new(),
+        tried: BTreeSet::new(),
+    };
+    let last = segments.len().saturating_sub(1);
+    let mut newest_segment_of: BTreeMap<u32, usize> = BTreeMap::new();
+    for (i, seg) in segments.iter().enumerate() {
+        // The current segment's rate is `current` even when nothing named
+        // it (it is what the port is configured to now).
+        let Some(baud) = seg.baud.or((i == last).then_some(current)) else {
             continue;
         };
-        if readable {
-            *history.readable_lines.entry(baud).or_default() += 1;
-            history.last_readable_seq.entry(baud).or_insert(line.seq);
+        newest_segment_of.insert(baud, i);
+        if seg.readable_lines > 0 {
+            *history.readable_lines.entry(baud).or_default() += seg.readable_lines;
+            history.last_readable_segment.insert(baud, i);
+            if let Some(t) = seg.last_readable_t_mono {
+                let entry = history.last_readable_t_mono.entry(baud).or_insert(t);
+                *entry = entry.max(t);
+            }
         }
     }
-    // Newest segment per rate decides whether that rate is known bad.
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    for (segment, stats) in segments.iter().rev() {
-        let Some(baud) = timeline.baud_of_segment(*segment) else {
-            continue;
-        };
-        if !seen.insert(baud) || baud == current {
-            continue;
-        }
-        let ratio = stats.non_text as f64 / stats.bytes.max(1) as f64;
-        if stats.bytes >= MIN_SAMPLE_BYTES && ratio >= UNDECODABLE_THRESHOLD && stats.readable == 0
-        {
-            history.known_bad.insert(baud);
+    for (baud, i) in newest_segment_of {
+        if baud != current && i != last && segments[i].readable_lines == 0 {
+            history.tried.insert(baud);
         }
     }
     history
 }
 
 /// Decode health of the recent sample plus, if warranted, a suggested rate
-/// and its basis — see the module docs for the rules.
-///
-/// - `current`: the port's configured rate now.
-/// - `recent`: the newest raw `rx` chunks
-///   ([`crate::query::DeviceQueryState::recent_rx`]); only those recorded
-///   after the last rate change are sampled.
-/// - `lines`: assembled history, oldest first (scanned newest first, up to
-///   [`HISTORY_MAX_BYTES`]).
-/// - `events`: the device's `config_change` events (other events are
-///   ignored), used to attribute each line to the rate it was read at.
-pub fn infer(
-    current: u32,
-    recent: &[RecentRxChunk],
-    lines: &[AssembledLine],
-    events: &[OobRecord],
-) -> DecodeHealth {
-    let timeline = BaudTimeline::from_events(events, current);
-    let since = timeline.last_change_seq();
-    let chunks: Vec<&RecentRxChunk> = recent
+/// and its basis — see the module docs for the rules. `configured` is the
+/// rate the saved configuration names; the tracker's own idea of the rate
+/// the port is actually reading at wins when it has one (a change the port
+/// rejected leaves it on the old rate).
+pub fn infer(configured: u32, evidence: &EvidenceTracker) -> DecodeHealth {
+    let current_segment = evidence.segments.back();
+    let current = current_segment.and_then(|s| s.baud).unwrap_or(configured);
+    let since = current_segment.and_then(|s| s.start_seq);
+    let chunks: Vec<&RecentRxChunk> = evidence
+        .recent
         .iter()
         .filter(|c| since.is_none_or(|s| c.seq > s))
         .collect();
@@ -469,27 +605,22 @@ pub fn infer(
         .iter()
         .flat_map(|c| c.bytes.iter().copied())
         .collect();
-    let checked_bytes = sample.len();
-    let undecodable_ratio = if checked_bytes == 0 {
-        0.0
-    } else {
-        count_non_text_bytes(&sample) as f64 / checked_bytes as f64
-    };
+    let (undecodable_ratio, counted) = non_text_ratio(&sample);
     let (text_lines, last_text_end) = text_profile(&sample);
-    // What arrived after the last readable line: "now". A device that
-    // printed its boot log and then switched into a binary protocol has
-    // both in the sample; only this tail says what it is doing *now*.
+    // What arrived after the last readable line: "now".
     let trailing = &sample[last_text_end..];
-    let no_text_now = trailing.len() >= MIN_SAMPLE_BYTES
-        && count_non_text_bytes(trailing) as f64 / trailing.len() as f64 >= NO_TEXT_NOW_RATIO;
+    let (trailing_ratio, trailing_counted) = non_text_ratio(trailing);
+    let no_text_now = trailing_counted >= MIN_SAMPLE_BYTES
+        && trailing_ratio >= NO_TEXT_NOW_RATIO
+        && trailing.len() as f64 >= sample.len() as f64 * NO_TEXT_NOW_MIN_SHARE;
     let mut health = DecodeHealth {
-        checked_bytes,
+        checked_bytes: sample.len(),
         undecodable_ratio,
         text_lines,
         newest_sample_t_wall: chunks.last().map(|c| c.t_wall.clone()),
         ..DecodeHealth::default()
     };
-    let garbled = checked_bytes >= MIN_SAMPLE_BYTES && undecodable_ratio >= UNDECODABLE_THRESHOLD;
+    let garbled = counted >= MIN_SAMPLE_BYTES && undecodable_ratio >= UNDECODABLE_THRESHOLD;
     if !garbled && !no_text_now {
         return health;
     }
@@ -497,143 +628,181 @@ pub fn infer(
         health.binary_protocol = Some("slip");
         return health;
     }
-    let history = scan_history(lines, &timeline, current);
-    health.suggestion = suggest(current, no_text_now, &history);
+    let history = summarize(&evidence.segments, current);
+    let newest_t = chunks.last().map(|c| c.t_mono);
+    let recently_readable_here = history
+        .last_readable_t_mono
+        .get(&current)
+        .is_some_and(|&t| newest_t.is_none_or(|now| now - t <= MODE_SWITCH_WINDOW_S));
+    let mode_switch = no_text_now
+        && recently_readable_here
+        && history.readable_lines.get(&current).copied().unwrap_or(0) >= READABLE_LINES_FOR_HISTORY;
+    health.suggestion = suggest(
+        current,
+        no_text_now,
+        mode_switch,
+        &history,
+        evidence.fingerprint,
+    );
     health.suggested_baud = health.suggestion.as_ref().map(|s| s.baud);
     health
 }
 
-fn next_rate_up(current: u32, excluded: impl Fn(u32) -> bool) -> Option<u32> {
-    RATES_ASCENDING
-        .iter()
-        .copied()
-        .find(|&b| b > current && !excluded(b))
+struct Candidate {
+    baud: u32,
+    basis: Basis,
+    fingerprint: Option<&'static Fingerprint>,
+    explanation: String,
 }
 
-fn suggest(current: u32, no_text_now: bool, history: &History) -> Option<BaudSuggestion> {
-    let excluded = |b: u32| b == current || history.known_bad.contains(&b);
+fn suggest(
+    current: u32,
+    no_text_now: bool,
+    mode_switch: bool,
+    history: &History,
+    fingerprint: Option<&'static Fingerprint>,
+) -> Option<BaudSuggestion> {
+    let excluded = |b: u32| b == current || history.tried.contains(&b);
     let readable_bauds: Vec<u32> = history
         .readable_lines
         .iter()
         .filter(|(_, &n)| n >= READABLE_LINES_FOR_HISTORY)
         .map(|(&b, _)| b)
         .collect();
-    // Readable lines at `current` in the history can only predate the
-    // trailing non-text run, so "readable here before, nothing now" is a
-    // mode switch rather than a wrong setting.
-    let mode_switch = no_text_now
-        && history.readable_lines.get(&current).copied().unwrap_or(0) >= READABLE_LINES_FOR_HISTORY;
-    let fingerprint = history.fingerprint.filter(|f| !excluded(f.baud));
-    let hit = |f: &Fingerprint| FingerprintHit {
-        pattern: f.pattern,
-        platform: f.platform,
-        source_url: f.source_url,
-        reason: f.reason,
-    };
-    let make =
-        |baud: u32, basis: Basis, fp: Option<&Fingerprint>, explanation: String| BaudSuggestion {
-            baud,
-            basis,
-            mode_switch,
-            readable_bauds: readable_bauds.clone(),
-            fingerprint: fp.map(hit),
-            explanation,
-        };
     let fingerprint_sentence = |f: &Fingerprint| {
         format!(
-            "The log earlier printed \"{}\" ({}); {}.",
+            "This connection's log printed \"{}\" ({}): {}.",
             f.pattern, f.platform, f.reason
         )
     };
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     if mode_switch {
         let switched = format!(
-            "It printed readable text at {current} earlier and none now, so the device appears \
-             to have switched modes."
+            "It printed readable text at {current} recently and nothing arriving now is text, so \
+             the device appears to have switched modes."
         );
-        // A mode switch (into a bootloader or download protocol) almost
-        // always speeds up, and a rate faster than the read rate is
-        // exactly what decodes to nothing — so only rates above `current`.
+        // Faster rates only: a mode switch into a bootloader or download
+        // protocol almost always speeds up. Current evidence (a faster
+        // rate this device was readable at) ranks above a table default.
+        for &b in readable_bauds.iter().filter(|&&b| b > current) {
+            candidates.push(Candidate {
+                baud: b,
+                basis: Basis::History,
+                fingerprint: None,
+                explanation: format!(
+                    "{switched} It printed readable text at {b} earlier in this connection."
+                ),
+            });
+        }
         if let Some(f) = fingerprint.filter(|f| f.baud > current) {
-            return Some(make(
-                f.baud,
-                Basis::Fingerprint,
-                Some(f),
-                format!("{switched} {}", fingerprint_sentence(f)),
-            ));
+            candidates.push(Candidate {
+                baud: f.baud,
+                basis: Basis::Fingerprint,
+                fingerprint: Some(f),
+                explanation: format!("{switched} {}", fingerprint_sentence(f)),
+            });
         }
-        if let Some(&b) = readable_bauds
+        for &b in RATES_ASCENDING.iter().filter(|&&b| b > current) {
+            candidates.push(Candidate {
+                baud: b,
+                basis: Basis::History,
+                fingerprint: None,
+                explanation: format!(
+                    "{switched} Faster rates are tried first in that case, so {b} is next — an \
+                     order to try in, not a reading off these bytes."
+                ),
+            });
+        }
+    } else {
+        let mut others: Vec<u32> = readable_bauds
             .iter()
-            .find(|&&b| b > current && !excluded(b))
-        {
-            return Some(make(
-                b,
-                Basis::History,
-                None,
-                format!("{switched} It also printed readable text at {b} before."),
-            ));
+            .copied()
+            .filter(|&b| b != current)
+            .collect();
+        others.sort_by_key(|b| {
+            std::cmp::Reverse(history.last_readable_segment.get(b).copied().unwrap_or(0))
+        });
+        for b in others {
+            candidates.push(Candidate {
+                baud: b,
+                basis: Basis::History,
+                fingerprint: None,
+                explanation: format!(
+                    "This device printed readable text at {b} earlier in this connection."
+                ),
+            });
         }
-        let b = next_rate_up(current, excluded)?;
-        return Some(make(
-            b,
-            Basis::History,
-            None,
-            format!(
-                "{switched} Such switches usually go faster, so {b} is the next common rate up — \
-                 a direction, not a reading off these bytes."
-            ),
-        ));
+        if let Some(f) = fingerprint {
+            candidates.push(Candidate {
+                baud: f.baud,
+                basis: Basis::Fingerprint,
+                fingerprint: Some(f),
+                explanation: fingerprint_sentence(f),
+            });
+        }
+        if no_text_now {
+            for &b in RATES_ASCENDING.iter().filter(|&&b| b > current) {
+                candidates.push(Candidate {
+                    baud: b,
+                    basis: Basis::Direction,
+                    fingerprint: None,
+                    explanation: format!(
+                        "Nothing arriving now is text. Faster rates are tried first, so {b} is \
+                         next — an order to try in, not a reading off these bytes."
+                    ),
+                });
+            }
+        }
+        for &b in FALLBACK_ORDER {
+            candidates.push(Candidate {
+                baud: b,
+                basis: Basis::Common,
+                fingerprint: None,
+                explanation: format!(
+                    "{b} is just the next common rate to try, not a reading off these bytes."
+                ),
+            });
+        }
     }
 
-    if let Some(b) = readable_bauds
-        .iter()
-        .copied()
-        .filter(|&b| !excluded(b))
-        .max_by_key(|b| history.last_readable_seq.get(b).copied().unwrap_or(0))
-    {
-        return Some(make(
-            b,
-            Basis::History,
-            None,
-            format!("This device printed readable text at {b} earlier in this log."),
+    let mut seen = BTreeSet::new();
+    let mut ordered = candidates
+        .into_iter()
+        .filter(|c| !excluded(c.baud) && seen.insert(c.baud));
+    let first = ordered.next()?;
+    let alternatives: Vec<u32> = ordered.take(MAX_ALTERNATIVES).map(|c| c.baud).collect();
+    let tried_bauds: Vec<u32> = history.tried.iter().copied().collect();
+    let mut explanation = first.explanation;
+    if !tried_bauds.is_empty() {
+        let list: Vec<String> = tried_bauds.iter().map(u32::to_string).collect();
+        explanation.push_str(&format!(
+            " Already tried in this connection without readable text: {}.",
+            list.join(", ")
         ));
     }
-    if let Some(f) = fingerprint {
-        return Some(make(
-            f.baud,
-            Basis::Fingerprint,
-            Some(f),
-            fingerprint_sentence(f),
-        ));
-    }
-    if no_text_now {
-        if let Some(b) = next_rate_up(current, excluded) {
-            return Some(make(
-                b,
-                Basis::Direction,
-                None,
-                format!(
-                    "Nothing arriving now is text. When the real rate is higher than the one being read, \
-                     bits are lost and nothing decodes, so faster rates come first: {b} is the \
-                     next common rate up — a direction, not a reading off these bytes."
-                ),
-            ));
-        }
-    }
-    let b = FALLBACK_ORDER.iter().copied().find(|&b| !excluded(b))?;
-    Some(make(
-        b,
-        Basis::Common,
-        None,
-        format!("{b} is just the next common rate to try, not a reading off these bytes."),
-    ))
+    Some(BaudSuggestion {
+        baud: first.baud,
+        basis: first.basis,
+        mode_switch,
+        readable_bauds,
+        tried_bauds,
+        alternatives,
+        fingerprint: first.fingerprint.map(|f| FingerprintHit {
+            pattern: f.pattern,
+            platform: f.platform,
+            source_url: f.source_url,
+            also_see: f.also_see,
+            reason: f.reason,
+        }),
+        explanation,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use warden_proto::Kind;
+    use serde_json::{json, Map, Value};
 
     /// The issue's reference capture: an RTL8735B in UART download mode,
     /// read at 115200.
@@ -650,166 +819,215 @@ mod tests {
         "[video_pre_init_procedure] START",
     ];
 
-    fn line(seq: u64, raw: &[u8]) -> AssembledLine {
-        AssembledLine {
-            raw: raw.to_vec(),
-            text: String::from_utf8_lossy(raw).into_owned(),
-            seq,
-            t_mono: 0.0,
-            t_wall: "2026-10-06T00:00:00Z".into(),
-            capped: false,
-        }
+    /// Feeds an [`EvidenceTracker`] the way the query layer does, with a
+    /// controllable clock.
+    struct Sim {
+        tracker: EvidenceTracker,
+        seq: u64,
+        t: f64,
     }
 
-    fn chunk(seq: u64, bytes: &[u8]) -> RecentRxChunk {
-        RecentRxChunk {
-            seq,
-            t_wall: format!("2026-10-06T00:00:{:02}Z", seq % 60),
-            bytes: bytes.to_vec(),
-        }
-    }
-
-    fn baud_change(seq: u64, old: u32, new: u32) -> OobRecord {
-        let mut extra = serde_json::Map::new();
-        extra.insert("old".into(), json!({ "baud": old, "data_bits": "eight" }));
-        extra.insert("new".into(), json!({ "baud": new, "data_bits": "eight" }));
-        extra.insert("changed_by".into(), "gui".into());
-        OobRecord {
-            seq,
-            t_mono: 0.0,
-            t_wall: String::new(),
-            kind: Kind::Event,
-            name: Some("config_change".into()),
-            extra,
-        }
-    }
-
-    /// `n` readable boot-log lines without a chip name, from `seq` on.
-    fn plain_text_lines(seq: u64, n: usize) -> Vec<AssembledLine> {
-        (0..n)
-            .map(|i| {
-                line(
-                    seq + i as u64,
-                    format!("[app] heartbeat tick {i}").as_bytes(),
-                )
-            })
+    fn extra(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect()
     }
 
-    fn garbled_chunks(seq: u64, n: usize) -> Vec<RecentRxChunk> {
-        (0..n)
-            .map(|i| chunk(seq + i as u64, ISSUE_SAMPLE))
-            .collect()
+    impl Sim {
+        fn new() -> Self {
+            Self {
+                tracker: EvidenceTracker::default(),
+                seq: 0,
+                t: 1000.0,
+            }
+        }
+        fn next(&mut self) -> u64 {
+            self.seq += 1;
+            self.t += 0.01;
+            self.seq
+        }
+        fn wait(&mut self, secs: f64) {
+            self.t += secs;
+        }
+        /// What every real connect writes: `connect`, then the
+        /// `system:connect` `config_change` naming the opened rate.
+        fn connect(&mut self, baud: u32) {
+            let s = self.next();
+            self.tracker.on_event(s, "connect", &Map::new());
+            let s = self.next();
+            self.tracker.on_event(
+                s,
+                "config_change",
+                &extra(&[
+                    ("old", Value::Null),
+                    ("new", json!({ "baud": baud })),
+                    ("changed_by", "system:connect".into()),
+                    ("applied", true.into()),
+                ]),
+            );
+        }
+        fn change(&mut self, old: u32, new: u32, applied: bool) {
+            let s = self.next();
+            self.tracker.on_event(
+                s,
+                "config_change",
+                &extra(&[
+                    ("old", json!({ "baud": old })),
+                    ("new", json!({ "baud": new })),
+                    ("changed_by", "gui".into()),
+                    ("applied", applied.into()),
+                ]),
+            );
+        }
+        fn line(&mut self, raw: &[u8]) {
+            let s = self.next();
+            let mut bytes = raw.to_vec();
+            bytes.extend(b"\r\n");
+            self.tracker
+                .on_rx(s, self.t, "2026-10-06T00:00:00Z", &bytes);
+            self.tracker.on_line(&AssembledLine {
+                raw: raw.to_vec(),
+                text: String::from_utf8_lossy(raw).into_owned(),
+                seq: s,
+                t_mono: self.t,
+                t_wall: "2026-10-06T00:00:00Z".into(),
+                capped: false,
+            });
+        }
+        fn text(&mut self, s: &str) {
+            self.line(s.as_bytes());
+        }
+        fn texts(&mut self, n: usize) {
+            for i in 0..n {
+                self.text(&format!("[app] heartbeat tick {i}"));
+            }
+        }
+        /// Raw bytes that complete no line.
+        fn bytes(&mut self, b: &[u8]) {
+            let s = self.next();
+            self.tracker.on_rx(s, self.t, "2026-10-06T00:00:00Z", b);
+        }
+        fn garbage(&mut self, n: usize) {
+            for _ in 0..n {
+                self.bytes(ISSUE_SAMPLE);
+            }
+        }
+        fn health(&self, configured: u32) -> DecodeHealth {
+            infer(configured, &self.tracker)
+        }
+        fn suggestion(&self, configured: u32) -> BaudSuggestion {
+            self.health(configured).suggestion.expect("suggestion")
+        }
     }
 
     #[test]
-    fn non_text_counts_invalid_utf8_and_controls_but_not_ansi_or_whitespace() {
+    fn classify_counts_garbage_and_controls_but_not_text_or_neutral_bytes() {
         assert_eq!(
-            count_non_text_bytes(b"hello\tworld\r\n\x1b[31mred\x1b[0m"),
-            0
+            classify_bytes(b"hello\tworld\r\n\x1b[31mred\x1b[0m"),
+            (0, 0)
         );
-        assert_eq!(count_non_text_bytes(&[0x80]), 1);
-        assert_eq!(count_non_text_bytes(&[b'a', 0x08, b'b', 0x04]), 2);
+        assert_eq!(classify_bytes(&[0x80]), (1, 0));
+        assert_eq!(classify_bytes(&[b'a', 0x04, b'b', 0x06]), (2, 0));
+        assert_eq!(classify_bytes(b" 42%\x08\x08\x08\x08\0\x0e\x0f"), (0, 7));
         // A truncated multi-byte sequence at the very end is undecodable.
-        assert_eq!(count_non_text_bytes(&[b'a', 0xe6, 0x97]), 2);
-        // Valid non-ASCII text is text.
-        assert_eq!(count_non_text_bytes("溫度 25°C".as_bytes()), 0);
+        assert_eq!(classify_bytes(&[b'a', 0xe6, 0x97]), (2, 0));
+        assert_eq!(classify_bytes("溫度 25°C".as_bytes()), (0, 0));
     }
 
     #[test]
     fn the_issue_sample_is_overwhelmingly_non_text_and_not_slip() {
-        let ratio = count_non_text_bytes(ISSUE_SAMPLE) as f64 / ISSUE_SAMPLE.len() as f64;
-        assert!(ratio > 0.8, "ratio {ratio}");
+        let (ratio, _) = non_text_ratio(ISSUE_SAMPLE);
+        assert!(ratio > 0.6, "ratio {ratio}");
         assert!(!looks_like_slip(ISSUE_SAMPLE));
         assert!(!looks_like_slip(&ISSUE_SAMPLE.repeat(40)));
     }
 
     #[test]
     fn clean_text_gets_no_suggestion() {
-        let recent = [chunk(
-            1,
-            b"boot ok\r\nsensor ready, 25.3C\r\n".repeat(4).as_slice(),
-        )];
-        let health = infer(115_200, &recent, &[], &[]);
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.texts(10);
+        let health = sim.health(115_200);
         assert_eq!(health.undecodable_ratio, 0.0);
-        assert!(health.text_lines >= 4);
+        assert_eq!(health.text_lines, 10);
         assert_eq!(health.suggestion, None);
-        assert_eq!(health.suggested_baud, None);
     }
 
     #[test]
     fn a_sample_below_the_minimum_size_gets_no_suggestion() {
-        let recent = [chunk(1, &[0x80; MIN_SAMPLE_BYTES - 1])];
-        let health = infer(115_200, &recent, &[], &[]);
+        let mut sim = Sim::new();
+        sim.bytes(&[0x80; MIN_SAMPLE_BYTES - 1]);
+        let health = sim.health(115_200);
         assert_eq!(health.undecodable_ratio, 1.0);
         assert_eq!(health.suggestion, None);
     }
 
     #[test]
     fn nothing_sampled_reports_zero_and_no_suggestion() {
-        let health = infer(115_200, &[], &[], &[]);
+        let health = Sim::new().health(115_200);
         assert_eq!(health.checked_bytes, 0);
         assert_eq!(health.undecodable_ratio, 0.0);
         assert_eq!(health.newest_sample_t_wall, None);
         assert_eq!(health.suggestion, None);
     }
 
-    /// Acceptance criterion 1: readable at 115200 earlier, now all binary —
-    /// the suggestion goes up, never to 115200 or below, and says why.
+    /// Readable at 115200 a moment ago, now all binary: the suggestion goes
+    /// up, never to 115200 or below, and says why.
     #[test]
-    fn history_readable_at_the_current_rate_then_all_binary_suggests_upward() {
-        let lines = plain_text_lines(1, 20);
-        let recent = garbled_chunks(100, 10);
-        let health = infer(115_200, &recent, &lines, &[]);
-        let s = health.suggestion.expect("suggestion");
+    fn readable_at_the_current_rate_then_all_binary_suggests_upward() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.texts(20);
+        sim.garbage(10);
+        let s = sim.suggestion(115_200);
         assert_eq!(s.basis, Basis::History);
         assert!(s.mode_switch);
-        assert!(s.baud > 115_200, "suggested {}", s.baud);
         assert_eq!(s.baud, 230_400);
+        assert_eq!(s.alternatives, vec![460_800, 921_600, 1_500_000]);
         assert_eq!(s.readable_bauds, vec![115_200]);
         assert!(
             s.explanation.contains("switched modes"),
             "{}",
             s.explanation
         );
-        assert_eq!(health.suggested_baud, Some(s.baud));
-        assert_eq!(health.text_lines, 0);
+        assert!(
+            s.explanation.contains("order to try in"),
+            "{}",
+            s.explanation
+        );
     }
 
     #[test]
-    fn a_mode_switch_prefers_a_faster_rate_the_device_was_readable_at() {
-        // Readable at 921600 first, then moved to 115200 and readable
-        // there, now garbled at 115200.
-        let mut lines = plain_text_lines(1, 10);
-        lines.extend(plain_text_lines(20, 10));
-        let events = [
-            baud_change(0, 115_200, 921_600),
-            baud_change(15, 921_600, 115_200),
-        ];
-        let recent = garbled_chunks(100, 10);
-        let s = infer(115_200, &recent, &lines, &events)
-            .suggestion
-            .expect("suggestion");
+    fn a_faster_rate_this_device_was_readable_at_outranks_a_fingerprint() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.text(ISSUE_TEXT[0]);
+        sim.change(115_200, 921_600, true);
+        sim.texts(10);
+        sim.change(921_600, 115_200, true);
+        sim.texts(10);
+        sim.garbage(10);
+        let s = sim.suggestion(115_200);
         assert_eq!(s.basis, Basis::History);
         assert!(s.mode_switch);
         assert_eq!(s.baud, 921_600);
-        assert_eq!(s.readable_bauds, vec![115_200, 921_600]);
+        assert_eq!(s.alternatives[0], 1_500_000);
     }
 
-    /// Acceptance criterion 2, with the issue's own data: the RTL8735B
-    /// banner was recorded, then the download-mode bytes — 1500000, with the
-    /// source carried through.
+    /// The issue's own data: the RTL8735B banner, then the download-mode
+    /// bytes — 1500000 with its source, and wording that says what the
+    /// number is and isn't.
     #[test]
-    fn the_rtl8735b_fingerprint_suggests_1500000_with_its_source() {
-        let mut lines: Vec<AssembledLine> = ISSUE_TEXT
-            .iter()
-            .enumerate()
-            .map(|(i, t)| line(i as u64 + 1, t.as_bytes()))
-            .collect();
-        lines.extend(plain_text_lines(10, 10));
-        let recent = garbled_chunks(100, 10);
-        let health = infer(115_200, &recent, &lines, &[]);
-        let s = health.suggestion.expect("suggestion");
+    fn the_rtl8735b_fingerprint_suggests_1500000_with_its_sources() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        for t in ISSUE_TEXT {
+            sim.text(t);
+        }
+        sim.texts(10);
+        sim.garbage(10);
+        let s = sim.suggestion(115_200);
         assert_eq!(s.baud, 1_500_000);
         assert_eq!(s.basis, Basis::Fingerprint);
         assert!(s.mode_switch);
@@ -819,55 +1037,55 @@ mod tests {
             fp.source_url,
             "https://aiot.realmcu.com/en/latest/tools/image_tool/index.html"
         );
-        assert!(s.explanation.contains("RTL8735B"), "{}", s.explanation);
-        assert!(
-            s.explanation.contains("switched modes"),
-            "{}",
-            s.explanation
-        );
+        assert_eq!(fp.also_see.len(), 1);
+        for needle in [
+            "Image Tool",
+            "-b",
+            "3000000",
+            "announces 115200",
+            "switched modes",
+        ] {
+            assert!(
+                s.explanation.contains(needle),
+                "{needle}: {}",
+                s.explanation
+            );
+        }
     }
 
     #[test]
-    fn a_fingerprint_without_mode_switch_history_still_suggests_its_rate() {
-        // One banner line is not enough history to call a mode switch.
-        let lines = [line(1, ISSUE_TEXT[0].as_bytes())];
-        let s = infer(115_200, &garbled_chunks(100, 3), &lines, &[])
-            .suggestion
-            .expect("suggestion");
+    fn a_fingerprint_is_found_in_a_line_that_also_holds_garbage() {
+        let mut sim = Sim::new();
+        sim.connect(9600);
+        let mut raw = ISSUE_SAMPLE.to_vec();
+        raw.extend(ISSUE_TEXT[0].as_bytes());
+        sim.line(&raw);
+        sim.garbage(3);
+        let s = sim.suggestion(9600);
         assert_eq!(s.basis, Basis::Fingerprint);
         assert!(!s.mode_switch);
         assert_eq!(s.baud, 1_500_000);
     }
 
     #[test]
-    fn a_fingerprint_is_found_in_a_line_that_also_holds_garbage() {
-        let mut raw = ISSUE_SAMPLE.to_vec();
-        raw.extend(ISSUE_TEXT[0].as_bytes());
-        let s = infer(9600, &garbled_chunks(100, 3), &[line(1, &raw)], &[])
-            .suggestion
-            .expect("suggestion");
-        assert_eq!(s.basis, Basis::Fingerprint);
-        assert_eq!(s.baud, 1_500_000);
-    }
-
-    #[test]
     fn a_mode_switch_never_follows_a_fingerprint_downward() {
-        // ESP8266's 74880 is below 115200: with mode-switch evidence the
-        // suggestion must still go up.
-        let mut lines = vec![line(1, b"ets Jan  8 2013,rst cause:2, boot mode:(3,6)")];
-        lines.extend(plain_text_lines(2, 10));
-        let s = infer(115_200, &garbled_chunks(100, 3), &lines, &[])
-            .suggestion
-            .expect("suggestion");
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.text("ets Jan  8 2013,rst cause:2, boot mode:(3,6)");
+        sim.texts(10);
+        sim.garbage(3);
+        let s = sim.suggestion(115_200);
         assert!(s.baud > 115_200, "suggested {}", s.baud);
         assert_eq!(s.basis, Basis::History);
     }
 
-    /// Acceptance criterion 3: all binary, zero text lines, no history at
-    /// all — a suggestion still appears, and it goes up.
+    /// All binary, zero text lines, no history at all — a suggestion still
+    /// appears, and faster rates come first.
     #[test]
     fn all_binary_with_no_history_suggests_the_next_rate_up() {
-        let health = infer(115_200, &[chunk(1, ISSUE_SAMPLE)], &[], &[]);
+        let mut sim = Sim::new();
+        sim.garbage(2);
+        let health = sim.health(115_200);
         assert_eq!(health.text_lines, 0);
         let s = health.suggestion.expect("suggestion");
         assert_eq!(s.basis, Basis::Direction);
@@ -876,14 +1094,14 @@ mod tests {
     }
 
     #[test]
-    fn mixed_garble_with_some_text_falls_back_to_the_common_list() {
-        // Garbage interleaved with text that keeps arriving: not "no text
-        // now", no history, no fingerprint.
-        let mut bytes = b"[boot] starting services\r\n".to_vec();
-        bytes.extend(ISSUE_SAMPLE.repeat(3));
-        bytes.extend(b"\r\n[boot] services up and running\r\n");
-        let health = infer(9600, &[chunk(1, &bytes)], &[], &[]);
-        let s = health.suggestion.expect("suggestion");
+    fn garble_with_text_still_arriving_falls_back_to_the_common_list() {
+        let mut sim = Sim::new();
+        sim.connect(9600);
+        sim.text("[boot] starting services");
+        sim.garbage(3);
+        sim.bytes(b"\r\n");
+        sim.text("[boot] services up and running");
+        let s = sim.suggestion(9600);
         assert_eq!(s.basis, Basis::Common);
         assert_eq!(s.baud, 115_200);
         assert!(s.explanation.contains("not a reading off these bytes"));
@@ -891,47 +1109,166 @@ mod tests {
 
     #[test]
     fn only_bytes_since_the_last_rate_change_are_sampled() {
-        // Garbage at 115200, then a switch to 1500000 with clean text: the
-        // garbage belongs to the old rate and must not count.
-        let mut recent = garbled_chunks(1, 5);
-        let clean = b"nor download success, rebooting now\r\n";
-        recent.push(chunk(20, clean));
-        let events = [baud_change(10, 115_200, 1_500_000)];
-        let health = infer(1_500_000, &recent, &[], &events);
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.garbage(5);
+        sim.change(115_200, 1_500_000, true);
+        sim.text("nor download success, rebooting now");
+        let health = sim.health(1_500_000);
         assert_eq!(health.undecodable_ratio, 0.0);
-        assert_eq!(health.checked_bytes, clean.len());
+        assert_eq!(
+            health.checked_bytes,
+            "nor download success, rebooting now\r\n".len()
+        );
         assert_eq!(health.suggestion, None);
     }
 
+    /// Review item 2: readable text from an earlier connection (another
+    /// board on the same adapter) is not evidence about this one.
     #[test]
-    fn a_rate_already_tried_and_garbled_is_not_suggested_again() {
-        // Readable at 115200; tried 230400 (garbage, no readable lines);
-        // back at 115200 and still garbled → skip 230400.
-        let mut lines = plain_text_lines(1, 10);
-        lines.extend((0..5).map(|i| line(30 + i, &ISSUE_SAMPLE.repeat(2))));
-        let events = [
-            baud_change(20, 115_200, 230_400),
-            baud_change(40, 230_400, 115_200),
-        ];
-        let s = infer(115_200, &garbled_chunks(100, 5), &lines, &events)
-            .suggestion
-            .expect("suggestion");
+    fn history_from_an_earlier_connection_is_not_a_mode_switch() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        for t in ISSUE_TEXT {
+            sim.text(t);
+        }
+        sim.texts(20);
+        sim.connect(115_200);
+        sim.garbage(10);
+        let s = sim.suggestion(115_200);
+        assert!(!s.mode_switch);
+        assert_eq!(s.basis, Basis::Direction);
+        assert!(s.fingerprint.is_none());
+        assert!(s.readable_bauds.is_empty());
+    }
+
+    #[test]
+    fn readable_text_older_than_the_window_is_not_a_mode_switch() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.texts(20);
+        sim.wait(MODE_SWITCH_WINDOW_S + 60.0);
+        sim.garbage(10);
+        let s = sim.suggestion(115_200);
+        assert!(!s.mode_switch);
+        assert_eq!(s.basis, Basis::Direction);
+    }
+
+    /// Review item 3: a rate tried with binary output and no line break
+    /// (so no assembled line at all) is not suggested again; the next one is.
+    #[test]
+    fn a_rate_tried_with_only_binary_is_not_suggested_again() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.texts(10);
+        sim.garbage(5);
+        sim.change(115_200, 230_400, true);
+        sim.garbage(20);
+        sim.change(230_400, 115_200, true);
+        sim.garbage(5);
+        let s = sim.suggestion(115_200);
         assert_eq!(s.baud, 460_800);
+        assert_eq!(s.tried_bauds, vec![230_400]);
+        assert!(s.explanation.contains("Already tried"), "{}", s.explanation);
+    }
+
+    #[test]
+    fn a_rate_tried_in_silence_is_not_suggested_again_either() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        for t in ISSUE_TEXT {
+            sim.text(t);
+        }
+        sim.texts(10);
+        sim.garbage(5);
+        sim.change(115_200, 1_500_000, true);
+        sim.change(1_500_000, 115_200, true);
+        sim.garbage(5);
+        let s = sim.suggestion(115_200);
+        assert_eq!(s.tried_bauds, vec![1_500_000]);
+        assert_ne!(s.baud, 1_500_000);
+        assert_eq!(s.baud, 230_400);
+    }
+
+    /// Review item 6: a change the port rejected left it reading at the old
+    /// rate — no new segment, nothing counted as tried, sampling continues.
+    #[test]
+    fn a_change_the_port_rejected_is_not_a_tried_rate() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.texts(10);
+        sim.garbage(5);
+        sim.change(115_200, 1_500_000, false);
+        sim.garbage(5);
+        // The saved configuration says 1500000; the port still reads 115200.
+        let health = sim.health(1_500_000);
+        // Sampling did not restart at the rejected change: all ten bursts count.
+        assert!(
+            health.checked_bytes >= 10 * ISSUE_SAMPLE.len(),
+            "{health:?}"
+        );
+        let s = health.suggestion.expect("suggestion");
+        assert!(s.tried_bauds.is_empty());
+        assert!(s.mode_switch);
+        assert_eq!(s.baud, 230_400);
     }
 
     #[test]
     fn readable_history_at_another_rate_is_suggested_back() {
-        // Readable at 9600, then someone switched to 115200: garbage.
-        let lines = plain_text_lines(1, 10);
-        let events = [baud_change(50, 9600, 115_200)];
-        let mut bytes = b"x [ok]\r\n".to_vec();
-        bytes.extend(ISSUE_SAMPLE.repeat(3));
-        let s = infer(115_200, &[chunk(60, &bytes)], &lines, &events)
-            .suggestion
-            .expect("suggestion");
+        let mut sim = Sim::new();
+        sim.connect(9600);
+        sim.texts(10);
+        sim.change(9600, 115_200, true);
+        sim.garbage(3);
+        let s = sim.suggestion(115_200);
         assert_eq!(s.basis, Basis::History);
         assert_eq!(s.baud, 9600);
         assert!(!s.mode_switch);
+    }
+
+    /// Review item 7: what real consoles send at the correct rate.
+    #[test]
+    fn a_backspace_progress_counter_is_not_garbage() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.text("Downloading firmware image");
+        for pct in 0..60 {
+            sim.bytes(format!("{pct:3}%\x08\x08\x08\x08").as_bytes());
+        }
+        let health = sim.health(115_200);
+        assert_eq!(health.undecodable_ratio, 0.0, "{health:?}");
+        assert_eq!(health.suggestion, None);
+    }
+
+    #[test]
+    fn nul_padding_after_clean_text_is_not_a_mode_switch() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        sim.texts(20);
+        sim.bytes(&[0u8; 40]);
+        assert_eq!(sim.health(115_200).suggestion, None);
+    }
+
+    #[test]
+    fn a_binary_frame_between_text_sentences_is_not_a_mode_switch() {
+        // A GPS receiver interleaving NMEA text with a UBX binary message.
+        let mut sim = Sim::new();
+        sim.connect(9600);
+        for i in 0..60 {
+            sim.text(&format!(
+                "$GPGGA,0921{i:02}.00,2503.71,N,12129.07,E,1,08,0.9,45.0,M,15.2,M,,*4{}",
+                i % 10
+            ));
+        }
+        let mut ubx = vec![0xB5, 0x62, 0x01, 0x07, 0x5C, 0x00];
+        ubx.extend((0..40u8).map(|i| 0x80 | i.wrapping_mul(37)));
+        sim.bytes(&ubx);
+        let health = sim.health(9600);
+        assert!(
+            health.undecodable_ratio < UNDECODABLE_THRESHOLD,
+            "{health:?}"
+        );
+        assert_eq!(health.suggestion, None);
     }
 
     /// SLIP frame: END, payload with every 0xC0/0xDB byte escaped, END.
@@ -948,8 +1285,8 @@ mod tests {
         out
     }
 
-    /// Acceptance criterion 4: SLIP traffic with regular frame lengths is
-    /// overwhelmingly non-text, and still gets no suggestion.
+    /// SLIP traffic with regular frame lengths is overwhelmingly non-text,
+    /// and still gets no suggestion.
     #[test]
     fn slip_framed_binary_traffic_gets_no_suggestion() {
         let mut stream = vec![0x01, 0x8f, 0x92]; // tail of a frame cut by the window
@@ -967,7 +1304,9 @@ mod tests {
         }
         stream.extend([0xC0, 0x90, 0x81]); // start of a frame cut by the window
         assert!(looks_like_slip(&stream));
-        let health = infer(115_200, &[chunk(1, &stream)], &[], &[]);
+        let mut sim = Sim::new();
+        sim.bytes(&stream);
+        let health = sim.health(115_200);
         assert!(health.undecodable_ratio >= UNDECODABLE_THRESHOLD);
         assert_eq!(health.binary_protocol, Some("slip"));
         assert_eq!(health.suggestion, None);
@@ -975,28 +1314,29 @@ mod tests {
     }
 
     #[test]
-    fn slip_detection_rejects_irregular_frames_and_bad_escapes() {
-        // Irregular lengths: 4, 60, 9 bytes.
+    fn slip_detection_rejects_irregular_frames_bad_escapes_and_tiny_samples() {
         let mut irregular = Vec::new();
         for len in [4usize, 60, 9, 30] {
             irregular.extend(slip_frame(&vec![0x90; len]));
         }
         assert!(!looks_like_slip(&irregular));
-        // Regular lengths but an invalid escape (0xDB 0x41).
         let mut bad_escape = Vec::new();
         for _ in 0..5 {
             bad_escape.extend([0xC0, 0x90, 0xDB, 0x41, 0x91, 0x92, 0xC0]);
         }
         assert!(!looks_like_slip(&bad_escape));
-        // Too few frames.
         assert!(!looks_like_slip(&slip_frame(&[0x90; 10])));
-        // Long unframed garbage after the last delimiter.
         let mut unframed = Vec::new();
         for _ in 0..4 {
             unframed.extend(slip_frame(&[0x90; 10]));
         }
         unframed.extend(ISSUE_SAMPLE.repeat(4));
         assert!(!looks_like_slip(&unframed));
+        // Three one-byte frames are framing-shaped but far too little to
+        // call a protocol.
+        assert!(!looks_like_slip(&[
+            0xC0, 0x90, 0xC0, 0x91, 0xC0, 0x92, 0xC0
+        ]));
     }
 
     #[test]
@@ -1005,31 +1345,27 @@ mod tests {
             assert!(!f.pattern.is_empty());
             assert!(f.baud > 0);
             assert!(f.source_url.starts_with("https://"), "{}", f.pattern);
-            assert!(!f.reason.is_empty());
+            assert!(f.also_see.iter().all(|u| u.starts_with("https://")));
+            assert!(!f.reason.is_empty() && !f.reason.ends_with('.'));
             assert!(!f.platform.is_empty());
         }
     }
 
     #[test]
     fn config_change_events_with_bare_numeric_values_are_understood() {
-        let mut extra = serde_json::Map::new();
-        extra.insert("field".into(), "baud".into());
-        extra.insert("old".into(), 9600.into());
-        extra.insert("new".into(), 115_200.into());
-        let ev = OobRecord {
-            seq: 5,
-            t_mono: 0.0,
-            t_wall: String::new(),
-            kind: Kind::Event,
-            name: Some("config_change".into()),
-            extra,
-        };
-        let timeline = BaudTimeline::from_events(&[ev], 115_200);
-        assert_eq!(timeline.last_change_seq(), Some(5));
-        assert_eq!(timeline.baud_of_segment(timeline.segment_of(1)), Some(9600));
-        assert_eq!(
-            timeline.baud_of_segment(timeline.segment_of(6)),
-            Some(115_200)
+        let mut tracker = EvidenceTracker::default();
+        tracker.on_event(
+            5,
+            "config_change",
+            &extra(&[
+                ("field", "baud".into()),
+                ("old", 9600.into()),
+                ("new", 115_200.into()),
+            ]),
         );
+        assert_eq!(tracker.segments.len(), 2);
+        assert_eq!(tracker.segments[0].baud, Some(9600));
+        assert_eq!(tracker.segments[1].baud, Some(115_200));
+        assert_eq!(tracker.segments[1].start_seq, Some(5));
     }
 }
