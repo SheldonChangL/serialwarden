@@ -15,7 +15,7 @@
 #      an unsupported OS/arch, or the download itself failed), fall back to
 #      building from source: clone the repo, build the web frontend, then
 #      `cargo build --release`. This fallback needs `git`, `cargo`, and
-#      `node`+`npm` already on PATH (see README.md, "Building from source");
+#      `node`+`npm` already on PATH (see docs/setup.md, "Building from source");
 #      this script never installs a Rust or Node toolchain on your behalf.
 #   3. Print (not run) the Linux permission steps — dialout group membership
 #      and the optional udev rule — since both need sudo, and a piped install
@@ -152,7 +152,7 @@ try_prebuilt_release() {
 
 build_from_source() {
     for tool in git cargo node npm; do
-        command -v "$tool" >/dev/null 2>&1 || die "'$tool' not found on PATH — building from source needs Rust (rustup) and Node.js 22+; see README.md"
+        command -v "$tool" >/dev/null 2>&1 || die "'$tool' not found on PATH — building from source needs Rust (rustup) and Node.js 22+; see docs/setup.md"
     done
     src=$(mktemp -d)
     log "building from source in $src (the slow path: expect a few minutes for the first cargo build)"
