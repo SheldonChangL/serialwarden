@@ -440,8 +440,6 @@ pub fn present(
 ) -> PresentedPage {
     let items = build_items(lines, events, limits);
 
-    let mut out_lines = Vec::new();
-    let mut out_events = Vec::new();
     // Start the budget already charged for the reply's own envelope. A
     // consumer that budgeted 8 KB of context genuinely cannot afford 8 KB
     // *plus* framing, and `json_size()` measures only the items — it was the
@@ -449,25 +447,53 @@ pub fn present(
     // limit by luck before.
     let mut bytes_used = ENVELOPE_BUDGET_RESERVE;
     let mut truncated = false;
-    let mut cursor = full_cursor;
-
-    for item in items {
-        let already_has_something = !out_lines.is_empty() || !out_events.is_empty();
-        let size = item.json_size();
-        if already_has_something && bytes_used + size > limits.max_result_bytes {
+    let mut n = 0;
+    while n < items.len() {
+        let size = items[n].json_size();
+        if n > 0 && bytes_used + size > limits.max_result_bytes {
             truncated = true;
             break;
         }
         bytes_used += size;
-        cursor = item.end_seq() + 1;
+        n += 1;
+    }
+
+    let mut cursor = full_cursor;
+    if truncated {
+        // A cursor is a record position, but one `rx` record often completes
+        // several lines that all carry its `seq` (issue #49). Cutting between
+        // two of them would make the continuation cursor skip the rest of
+        // that record, so a page may only end on a record boundary: back off
+        // every kept item that reaches into the record the cut lands in.
+        let mut boundary = items[n].start_seq();
+        while n > 0 && items[n - 1].end_seq() >= boundary {
+            n -= 1;
+            boundary = boundary.min(items[n].start_seq());
+        }
+        if n == 0 {
+            // Forward progress beats the cap (module docs' Known limitation):
+            // deliver the whole first record, plus anything sharing a seq
+            // with it, even though it alone busts the budget.
+            let mut end = items[0].end_seq();
+            n = 1;
+            while n < items.len() && items[n].start_seq() <= end {
+                end = end.max(items[n].end_seq());
+                n += 1;
+            }
+            truncated = n < items.len();
+            cursor = if truncated { end + 1 } else { full_cursor };
+        } else {
+            cursor = boundary;
+        }
+    }
+
+    let mut out_lines = Vec::new();
+    let mut out_events = Vec::new();
+    for item in items.into_iter().take(n) {
         match item {
             ViewItem::Line(l) => out_lines.push(l),
             ViewItem::Event(e) => out_events.push(e),
         }
-    }
-
-    if !truncated {
-        cursor = full_cursor;
     }
 
     PresentedPage {
@@ -1090,6 +1116,60 @@ mod tests {
         assert_eq!(page.lines.len(), 1);
         assert_eq!(page.lines[0].last_seq(), 4, "the survivor is the newest");
         assert!(page.truncated);
+    }
+
+    /// Issue #49, third point: one `rx` record routinely completes several
+    /// lines (a USB read delivers `"one\ntwo\nthree\n"` at once), and every
+    /// one of them carries that record's `seq`. Paging through with a cap
+    /// that falls between two such lines must not lose the rest of the
+    /// record, which the cursor (a record position) cannot point into.
+    #[test]
+    fn paging_never_loses_lines_that_share_a_record_seq() {
+        let mut lines = Vec::new();
+        let mut seq = 0u64;
+        for record in 0..6u64 {
+            for i in 0..4u64 {
+                lines.push(line(
+                    seq,
+                    format!("record {record} line {i}, padded to take room").as_bytes(),
+                ));
+            }
+            seq += 1;
+        }
+        let tip = seq;
+        let small = PresentationLimits {
+            max_result_bytes: ENVELOPE_BUDGET_RESERVE + 250,
+            ..PresentationLimits::default()
+        };
+
+        let mut cursor = 0u64;
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..100 {
+            let remaining: Vec<AssembledLine> =
+                lines.iter().filter(|l| l.seq >= cursor).cloned().collect();
+            let page = present(&remaining, &[], tip, &small);
+            assert!(!page.lines.is_empty(), "every page makes progress");
+            assert!(page.cursor > cursor, "the cursor always advances");
+            for l in &page.lines {
+                if let PresentedLine::Single {
+                    render: LineRender::Text { text, .. },
+                    ..
+                } = l
+                {
+                    seen.push(text.clone());
+                }
+            }
+            cursor = page.cursor;
+            if !page.truncated {
+                break;
+            }
+        }
+        let all: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
+        assert_eq!(
+            seen, all,
+            "paging must deliver every line exactly once, in order"
+        );
+        assert_eq!(cursor, tip);
     }
 
     // ---- cursor equivalence: paginated reads must match one whole read ----
