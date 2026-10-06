@@ -1424,6 +1424,118 @@ async fn set_config_over_the_wire_produces_a_config_change_event_and_never_touch
     println!("acceptance (T2.3) — config_change carries old/new over the wire; prior rx record unchanged: {config_change}");
 }
 
+/// `config_change` events in a `read_since` reply, minus the
+/// `system:connect` profile application every connect records.
+fn client_config_changes(read_reply: &Value) -> Vec<Value> {
+    read_reply["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["event"] == "config_change" && e["changed_by"] != "system:connect")
+        .cloned()
+        .collect()
+}
+
+/// Issue #51 over the UDS path the CLI and MCP bridge use, against the real
+/// `LiveBackend` (a `HotplugDetector` driving a PTY mock device), not the
+/// `TestBackend` double: one `set_config` is exactly one `config_change` —
+/// both in the stored stream and in what the daemon's query layer hands
+/// back, which is where the duplicate in the issue was actually produced —
+/// and repeating the request with the configuration already in effect
+/// records nothing.
+#[tokio::test]
+async fn one_set_config_over_the_wire_is_exactly_one_config_change_and_a_repeat_is_none() {
+    use serialwardend::port::testing::ScriptedEnumerator;
+    use serialwardend::port::{EnumeratedDevice, HotplugConfig, HotplugDetector, UsbMetadata};
+    use serialwardend::protocol::backend::LiveBackend;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let device = mock_device::MockDevice::new().expect("open mock device");
+    let usb = UsbMetadata {
+        vid: 0x067b,
+        pid: 0x2303,
+        serial_number: Some("ISSUE-51-UDS".to_string()),
+    };
+    let id = DeviceId::from_usb(&usb).expect("usb id");
+    let enumerator = ScriptedEnumerator::new();
+    enumerator.push(EnumeratedDevice {
+        path: device.slave_path().to_path_buf(),
+        usb: Some(usb),
+    });
+    let detector = HotplugDetector::new(
+        Box::new(enumerator),
+        tmp.path().join("data"),
+        HotplugConfig {
+            poll_interval: Duration::from_millis(5),
+            recorder_config: RecorderConfig::default(),
+        },
+    );
+    let recorders = detector.recorders();
+    let backend = Arc::new(LiveBackend::new(
+        detector.port_config_api(),
+        detector.recorders(),
+    ));
+    let handle = detector.spawn();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backend
+        .list_devices()
+        .iter()
+        .any(|d| d.id == id && d.connected)
+    {
+        assert!(Instant::now() < deadline, "device never connected");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "serialwarden-config", "human").await;
+    let device_id = id.0.clone();
+
+    c.send(json!({"id": 1, "op": "set_config", "device": device_id, "baud": 115200}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "set_config failed: {reply}");
+
+    c.send(json!({"id": 2, "op": "read_since", "device": device_id, "cursor": 0}))
+        .await;
+    let read_reply = c.recv().await;
+    let changes = client_config_changes(&read_reply);
+    assert_eq!(
+        changes.len(),
+        1,
+        "one set_config, one config_change: {changes:?}"
+    );
+    assert_eq!(changes[0]["old"]["baud"], 9600);
+    assert_eq!(changes[0]["new"]["baud"], 115200);
+
+    c.send(json!({"id": 3, "op": "set_config", "device": device_id, "baud": 115200}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "repeat set_config failed: {reply}");
+
+    c.send(json!({"id": 4, "op": "read_since", "device": device_id, "cursor": 0}))
+        .await;
+    let read_reply = c.recv().await;
+    assert_eq!(
+        client_config_changes(&read_reply).len(),
+        1,
+        "old == new must not append a config_change: {read_reply}"
+    );
+
+    // The stored stream agrees with what the query layer returned.
+    let recorder = Arc::clone(recorders.lock().unwrap().get(&id).unwrap());
+    let stored = recorder.read_since(0, usize::MAX).unwrap().records;
+    let stored_changes = stored
+        .iter()
+        .filter(|r| matches!(r, Record::Event { event, .. } if event == "config_change"))
+        .count();
+    assert_eq!(
+        stored_changes, 2,
+        "one system:connect plus one client change"
+    );
+
+    handle.stop();
+}
+
 // ---- T2.3 acceptance criterion (clients): the triple — name, verified pid, type, permission ----
 
 #[tokio::test]

@@ -2028,6 +2028,11 @@ impl PortConfigApi {
     /// currently connected, and append a `config_change` event carrying
     /// the full old/new values and `changed_by`.
     ///
+    /// A request whose `new_config` equals the current configuration is a
+    /// no-op and appends nothing (issue #51): `config_change` means the
+    /// configuration *changed*, and an `old == new` record reads in the
+    /// timeline as if it had.
+    ///
     /// Errors with [`io::ErrorKind::NotFound`] if `id` has never been seen
     /// by the detector at all. A live re-application failure (e.g. a real
     /// ioctl error) is logged, not returned — matching `attempt_open`'s
@@ -2047,6 +2052,9 @@ impl PortConfigApi {
                 io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
             })?;
             let old_config = entry.profile.config.clone();
+            if old_config == new_config {
+                return Ok(());
+            }
             entry.profile.config = new_config.clone();
             self.profiles.save(&id.0, &entry.profile)?;
             (old_config, entry.fd.clone())

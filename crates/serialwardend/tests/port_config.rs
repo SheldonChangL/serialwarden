@@ -177,6 +177,128 @@ fn set_port_config_persists_and_is_reapplied_after_reconnect() {
     assert_eq!(saved["config"]["baud"], 74_880);
 }
 
+/// `config_change` records filtered to one `changed_by`.
+fn config_changes_by<'a>(
+    records: &'a [Record],
+    changed_by: &str,
+) -> Vec<&'a serde_json::Map<String, serde_json::Value>> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Event { event, extra, .. }
+                if event == "config_change"
+                    && extra.get("changed_by").and_then(|v| v.as_str()) == Some(changed_by) =>
+            {
+                Some(extra)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Issue #51, against the real `HotplugDetector`/`PortConfigApi` (not the
+/// `TestBackend` double): one `set_port_config` call records exactly one
+/// `config_change`; repeating it with the configuration already in effect
+/// records none; and each (re)connect records exactly one `system:connect`
+/// profile application with `old: null`.
+#[test]
+fn config_change_is_recorded_once_per_real_change_and_once_per_connect() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut device = MockDevice::new().expect("open mock device");
+    let usb = UsbMetadata {
+        vid: 0x067b,
+        pid: 0x2303,
+        serial_number: Some("ISSUE-51".to_string()),
+    };
+    let id = DeviceId::from_usb(&usb).expect("usb id");
+    let old_path = device.slave_path().to_path_buf();
+
+    let enumerator = ScriptedEnumerator::new();
+    enumerator.push(EnumeratedDevice {
+        path: old_path.clone(),
+        usb: Some(usb),
+    });
+    let mut detector = HotplugDetector::new(
+        Box::new(enumerator.clone()),
+        tmp.path().join("data"),
+        tiny_poll_config(),
+    );
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |d| d
+            .recorders()
+            .lock()
+            .unwrap()
+            .contains_key(&id)),
+        "expected initial connect"
+    );
+    let recorder = Arc::clone(detector.recorders().lock().unwrap().get(&id).unwrap());
+    let records = || recorder.read_since(0, usize::MAX).unwrap().records;
+
+    let connects = config_changes_by(&records(), "system:connect").len();
+    assert_eq!(
+        connects, 1,
+        "first connect must record exactly one profile application"
+    );
+    assert!(config_changes_by(&records(), "system:connect")[0]["old"].is_null());
+
+    let api = detector.port_config_api();
+    let custom = PortConfig {
+        baud: 115_200,
+        ..PortConfig::default()
+    };
+    api.set_port_config(&id, custom.clone(), "test:once")
+        .expect("set_port_config");
+    let changes = config_changes_by(&records(), "test:once")
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changes.len(),
+        1,
+        "one set_port_config, one config_change: {changes:?}"
+    );
+    assert_eq!(changes[0]["old"]["baud"], 9600);
+    assert_eq!(changes[0]["new"]["baud"], 115_200);
+
+    // The same configuration again is a no-op, not a second change.
+    api.set_port_config(&id, custom.clone(), "test:once")
+        .expect("repeat set_port_config");
+    assert_eq!(
+        config_changes_by(&records(), "test:once").len(),
+        1,
+        "old == new must not append a config_change"
+    );
+
+    device.disconnect().expect("disconnect");
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |_| event_count(
+            &records(),
+            "disconnect"
+        ) == 1),
+        "expected a disconnect event"
+    );
+    device.reconnect().expect("reconnect");
+    enumerator.replace_path(&old_path, device.slave_path().to_path_buf());
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |_| event_count(
+            &records(),
+            "connect"
+        ) == 2),
+        "expected a reconnect"
+    );
+
+    let after = records();
+    let connects = config_changes_by(&after, "system:connect");
+    assert_eq!(
+        connects.len(),
+        2,
+        "each connect records exactly one profile application, never a duplicate"
+    );
+    assert!(connects[1]["old"].is_null());
+    assert_eq!(connects[1]["new"]["baud"], 115_200);
+    assert_eq!(event_count(&after, "config_change"), 3);
+}
+
 /// `PortConfigApi` methods must not silently succeed against a device the
 /// detector has never seen at all.
 #[test]

@@ -416,6 +416,10 @@ pub mod testing {
             let old = entry.config.clone();
             let merged = merge_config_patch(&entry.config, patch)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            if old == merged {
+                // Same no-op rule as `PortConfigApi::set_port_config`.
+                return Ok(merged);
+            }
             entry.config = merged.clone();
             let recorder = Arc::clone(&entry.recorder);
             drop(devices);

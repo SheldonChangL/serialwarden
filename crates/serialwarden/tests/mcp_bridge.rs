@@ -1413,14 +1413,26 @@ async fn agent_changes_baud_and_it_takes_effect_and_is_logged() {
     let config = mcp.call_tool("get_config", json!({"device": "dev"})).await;
     assert_eq!(config["config"]["baud"], 74880, "{config}");
 
+    // Issue #51: the same change again is a no-op, not a second record.
+    let repeat = mcp
+        .call_tool("set_config", json!({"device": "dev", "baud": 74880}))
+        .await;
+    assert_eq!(repeat["result"], "allowed", "{repeat}");
+
     let records = recorder.read_since(0, usize::MAX).unwrap().records;
-    let config_change = records
+    let config_changes: Vec<_> = records
         .iter()
-        .find_map(|r| match r {
+        .filter_map(|r| match r {
             Record::Event { event, extra, .. } if event == "config_change" => Some(extra.clone()),
             _ => None,
         })
-        .expect("expected a config_change event");
+        .collect();
+    assert_eq!(
+        config_changes.len(),
+        1,
+        "one change, one config_change: {config_changes:?}"
+    );
+    let config_change = &config_changes[0];
     assert_eq!(
         config_change
             .get("new")
