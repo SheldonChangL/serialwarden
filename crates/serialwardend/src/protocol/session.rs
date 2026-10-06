@@ -45,6 +45,7 @@ use crate::gate::{dtr_pulse_gate_bytes, GateDecision, RequesterCtx, DEFAULT_LOG_
 use crate::port::{DeviceId, LeaseError};
 use crate::query::{OobRecord, QueryError, QueryPage, WaitForOutcome};
 
+use super::backend::run_blocking;
 use super::peer_cred;
 use super::registry::Activity;
 use super::server::Shared;
@@ -660,7 +661,8 @@ async fn dispatch(
 
         Request::SetConfig { device, config } => {
             let dev = DeviceId(device.clone());
-            match shared.backend.set_config(&dev, &config, changed_by) {
+            let by = changed_by.to_string();
+            match run_blocking(&shared.backend, move |b| b.set_config(&dev, &config, &by)).await {
                 Ok(outcome) => send(shared, client_id, tx, ok_reply(id, outcome.reply_body())),
                 Err(e) => send(
                     shared,
@@ -673,7 +675,12 @@ async fn dispatch(
 
         Request::SetControlLine { device, dtr, rts } => {
             let dev = DeviceId(device.clone());
-            match shared.backend.set_control_line(&dev, dtr, rts, changed_by) {
+            let by = changed_by.to_string();
+            match run_blocking(&shared.backend, move |b| {
+                b.set_control_line(&dev, dtr, rts, &by)
+            })
+            .await
+            {
                 Ok(()) => send(
                     shared,
                     client_id,
@@ -840,27 +847,31 @@ async fn dispatch(
             };
 
             match resolution {
-                Ok(_gate_label) => match shared.backend.dtr_pulse(
-                    &dev,
-                    Duration::from_millis(duration_ms),
-                    changed_by,
-                ) {
-                    Ok(()) => send(
-                        shared,
-                        client_id,
-                        tx,
-                        ok_reply(
-                            id,
-                            serde_json::json!({ "pulsed": true, "duration_ms": duration_ms }),
+                Ok(_gate_label) => {
+                    let by = changed_by.to_string();
+                    let dev = dev.clone();
+                    let pulsed = run_blocking(&shared.backend, move |b| {
+                        b.dtr_pulse(&dev, Duration::from_millis(duration_ms), &by)
+                    })
+                    .await;
+                    match pulsed {
+                        Ok(()) => send(
+                            shared,
+                            client_id,
+                            tx,
+                            ok_reply(
+                                id,
+                                serde_json::json!({ "pulsed": true, "duration_ms": duration_ms }),
+                            ),
                         ),
-                    ),
-                    Err(e) => send(
-                        shared,
-                        client_id,
-                        tx,
-                        err_reply(Some(id), backend_error_to_wire(&e, &device)),
-                    ),
-                },
+                        Err(e) => send(
+                            shared,
+                            client_id,
+                            tx,
+                            err_reply(Some(id), backend_error_to_wire(&e, &device)),
+                        ),
+                    }
+                }
                 Err(reason) => {
                     let mut err = WireError::new(
                         ErrorCode::WriteDenied,
@@ -1410,9 +1421,10 @@ async fn dispatch(
             // one — narrowing that is T4.x's rule engine's job, not this
             // task's (`TASKS.md` T2.2).
             let dev = DeviceId(device.clone());
-            match shared
-                .backend
-                .acquire_lease(&dev, &command, peer_pid, timeout_s)
+            match run_blocking(&shared.backend, move |b| {
+                b.acquire_lease(&dev, &command, peer_pid, timeout_s)
+            })
+            .await
             {
                 Ok(acquired) => send(
                     shared,
@@ -1435,7 +1447,12 @@ async fn dispatch(
             }
         }
         Request::LeaseRelease { token, exit_code } => {
-            match shared.backend.release_lease(&token, exit_code) {
+            let token_for_call = token.clone();
+            match run_blocking(&shared.backend, move |b| {
+                b.release_lease(&token_for_call, exit_code)
+            })
+            .await
+            {
                 Ok(released) => send(
                     shared,
                     client_id,

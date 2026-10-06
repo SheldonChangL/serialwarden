@@ -98,13 +98,16 @@ function configDiff(old: PortConfigLike, next: PortConfigLike): string[] {
 
 /** `changed_by`/`kicked_by` are `"<name>:<pid>"` for a UDS peer and the bare
  * string `"gui"` for the web layer (`web::api`'s `GUI_CHANGED_BY`), plus
- * `"system:connect"` for the daemon applying a saved profile on open. Read
+ * `"system:connect"`/`"system:lease_end"` for the daemon applying a saved
+ * profile when it opens the port (on connect, or taking it back from a
+ * lease). Read
  * back as the actor, not the wire format. */
 function actor(raw: unknown): string | null {
   const s = str(raw);
   if (s === null) return null;
   if (s === "gui") return "this browser";
   if (s === "system:connect") return "the daemon, restoring this port's saved profile";
+  if (s === "system:lease_end") return "the daemon, reopening the port after a lease";
   return s;
 }
 
@@ -135,9 +138,16 @@ function notApplied(extra: Extra): { summary: string; detail: string } | null {
   if (extra.apply === "not_connected") {
     return { summary: "saved, applies when the port next opens", detail: "port not open (device disconnected or leased)" };
   }
+  // What the port runs instead depends on who applied it: a port the
+  // daemon just took back from a lease keeps whatever the lease's tool
+  // left it at, not "the previous settings" the timeline last showed.
+  const instead =
+    extra.changed_by === "system:lease_end"
+      ? "running whatever settings the lease's tool left until the device reconnects"
+      : "still running the previous settings until it reconnects";
   return {
     summary: "saved, NOT applied to the port",
-    detail: `port rejected it: ${str(extra.apply_error) ?? "unknown error"} · still running the previous settings until it reconnects`,
+    detail: `port rejected it: ${str(extra.apply_error) ?? "unknown error"} · ${instead}`,
   };
 }
 
@@ -157,10 +167,24 @@ function describeConfigChange(extra: Extra): EventDescription {
     // starting state, not a change. Saying "9600 → 9600" here would be a
     // lie, and saying "changed" would send someone hunting for who did it.
     const summary = `Port set to ${formatConfig(next)}`;
-    if (!failed) return { summary, detail: by ? `by ${by}` : null, tone: "rx" };
+    // Opening in DTR/RTS "assert" mode can fail on the lines alone, while
+    // baud and framing took; that is its own fact, not a failed apply.
+    const lineError = str(extra.control_line_error);
+    const lines = lineError ? `DTR/RTS not set: ${lineError}` : null;
+    // Same for a port left non-blocking: writes to it can fail outright.
+    const nonblockingError = str(extra.nonblocking_error);
+    const nonblocking = nonblockingError ? `writes may not wait: ${nonblockingError}` : null;
+    if (!failed) {
+      const caveat = lines ? "DTR/RTS not set" : nonblocking ? "writes may not wait" : null;
+      return {
+        summary: caveat ? `${summary} — ${caveat}` : summary,
+        detail: joinDetail(lines, nonblocking, by ? `by ${by}` : null),
+        tone: caveat ? "warn" : "rx",
+      };
+    }
     return {
       summary: `${summary} — ${failed.summary}`,
-      detail: joinDetail(failed.detail, by ? `by ${by}` : null),
+      detail: joinDetail(failed.detail, lines, nonblocking, by ? `by ${by}` : null),
       tone: "gate",
     };
   }

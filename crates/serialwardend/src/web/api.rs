@@ -103,6 +103,7 @@ use crate::gate::approval::{DecideError, Decision};
 use crate::gate::{GateDecision, RequesterCtx, DEFAULT_LOG_CONTEXT_LINES};
 use crate::port::DeviceId;
 use crate::presentation::{event_to_json, page_to_json, PresentationLimits};
+use crate::protocol::backend::run_blocking;
 use crate::protocol::registry::Activity;
 use crate::protocol::Shared;
 use crate::query::{AssembledLine, OobRecord, QueryError};
@@ -312,7 +313,11 @@ async fn set_config(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let dev = DeviceId(id.clone());
-    match shared.backend.set_config(&dev, &patch, GUI_CHANGED_BY) {
+    match run_blocking(&shared.backend, move |b| {
+        b.set_config(&dev, &patch, GUI_CHANGED_BY)
+    })
+    .await
+    {
         Ok(outcome) => Json(outcome.reply_body()).into_response(),
         Err(e) => backend_error_response(&e, &id),
     }
@@ -344,9 +349,11 @@ async fn set_control_lines(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let dev = DeviceId(id.clone());
-    match shared
-        .backend
-        .set_control_line(&dev, body.dtr, body.rts, GUI_CHANGED_BY)
+    let (dtr, rts) = (body.dtr, body.rts);
+    match run_blocking(&shared.backend, move |b| {
+        b.set_control_line(&dev, dtr, rts, GUI_CHANGED_BY)
+    })
+    .await
     {
         Ok(()) => Json(json!({ "dtr": body.dtr, "rts": body.rts })).into_response(),
         Err(e) => backend_error_response(&e, &id),
