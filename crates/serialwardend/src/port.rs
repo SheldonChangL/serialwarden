@@ -870,28 +870,45 @@ struct LiveDeviceConfig {
 /// [`PortConfigApi`].
 type SharedDeviceConfigs = Arc<Mutex<HashMap<DeviceId, LiveDeviceConfig>>>;
 
-/// Applies a configuration to a device's already-open fd during a live
-/// [`PortConfigApi::set_port_config`]. Production uses
-/// [`port_io::apply_termios`]; see [`HotplugDetector::with_live_config_applier`]
-/// for why it can be replaced.
+/// Applies a configuration's baud/framing to an open fd: when the daemon
+/// opens the port, and during a live [`PortConfigApi::set_port_config`].
+/// Production uses [`port_io::apply_termios`]; see
+/// [`HotplugDetector::with_live_config_applier`] for why it can be replaced.
 pub type LiveConfigApplier = Arc<dyn Fn(RawFd, &PortConfig) -> io::Result<()> + Send + Sync>;
 
-/// The live-apply half of [`PortConfigApi::set_port_config`]: the applier,
-/// plus a lock held for a whole `set_port_config` call so two concurrent
-/// requests cannot interleave their save, apply, and `config_change` steps
-/// (which could leave the port running one request's settings while the
-/// timeline's last `config_change` names the other's).
+/// Sets one control line while the daemon opens the port in
+/// `open_control_lines: assert` mode. Production uses
+/// [`port_io::set_control_line`]; see
+/// [`HotplugDetector::with_open_control_line_setter`].
+pub type ControlLineSetter = Arc<dyn Fn(RawFd, ControlLine, bool) -> io::Result<()> + Send + Sync>;
+
+/// Everything that applies a configuration to the port, and the lock that
+/// orders those applications. The lock is held for a whole
+/// `set_port_config` call *and* for the whole of opening the port (reading
+/// the profile, opening, applying, recording, publishing the fd), and for
+/// handing the port to a lease. So a `set_config` either finishes before an
+/// open starts (and that open applies what it saved) or starts after the
+/// open has published its fd (and applies live). Without it, a request in
+/// the window between "port opened" and "fd published" saw no fd, recorded
+/// `not_connected`, and the port came up running the previous profile.
+/// It also keeps two concurrent `set_port_config` calls from interleaving.
 struct LiveApply {
     applier: LiveConfigApplier,
+    control_line_setter: ControlLineSetter,
     serialize: Mutex<()>,
 }
 
 impl LiveApply {
-    fn new(applier: LiveConfigApplier) -> Arc<Self> {
+    fn new(applier: LiveConfigApplier, control_line_setter: ControlLineSetter) -> Arc<Self> {
         Arc::new(Self {
             applier,
+            control_line_setter,
             serialize: Mutex::new(()),
         })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.serialize.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -949,16 +966,21 @@ impl HotplugDetector {
             recorders: Arc::new(Mutex::new(HashMap::new())),
             configs: Arc::new(Mutex::new(HashMap::new())),
             profiles,
-            live_apply: LiveApply::new(Arc::new(port_io::apply_termios)),
+            live_apply: LiveApply::new(
+                Arc::new(port_io::apply_termios),
+                Arc::new(port_io::set_control_line),
+            ),
             lease_tx,
             lease_rx,
             leases: HashMap::new(),
         }
     }
 
-    /// Replace how a live [`PortConfigApi::set_port_config`] applies a
-    /// configuration to an open fd. Call before [`Self::port_config_api`]
-    /// or [`Self::spawn`]; APIs handed out earlier keep the old applier.
+    /// Replace how a configuration's baud/framing is applied to an open fd,
+    /// both when the port is opened and by a live
+    /// [`PortConfigApi::set_port_config`]. Call before
+    /// [`Self::port_config_api`] or [`Self::spawn`]; APIs handed out earlier
+    /// keep the old applier.
     ///
     /// This exists for tests. The failure it lets them reach is real (a
     /// macOS PL2303 driver returned `EINVAL` for every live baud change
@@ -966,8 +988,62 @@ impl HotplugDetector {
     /// it, so a test substitutes an applier that fails the same way and
     /// checks that the failure reaches the caller and the timeline.
     pub fn with_live_config_applier(mut self, applier: LiveConfigApplier) -> Self {
-        self.live_apply = LiveApply::new(applier);
+        self.live_apply = LiveApply::new(applier, Arc::clone(&self.live_apply.control_line_setter));
         self
+    }
+
+    /// Replace how DTR/RTS are set when the port is opened in
+    /// `open_control_lines: assert` mode. Same rules and reason as
+    /// [`Self::with_live_config_applier`]: adapters without modem lines
+    /// refuse these, and a test needs that refusal on demand.
+    pub fn with_open_control_line_setter(mut self, setter: ControlLineSetter) -> Self {
+        self.live_apply = LiveApply::new(Arc::clone(&self.live_apply.applier), setter);
+        self
+    }
+
+    /// Open `path` and apply `config` with this detector's appliers, and
+    /// say what took (see [`port_io::OpenedPort`]). Logged, never fatal
+    /// beyond the open itself: see `port_io`'s module docs.
+    fn open_port(
+        &self,
+        id: &DeviceId,
+        path: &Path,
+        config: &PortConfig,
+    ) -> io::Result<(File, PortApply)> {
+        let applier = Arc::clone(&self.live_apply.applier);
+        let setter = Arc::clone(&self.live_apply.control_line_setter);
+        let opened = port_io::open_and_configure_with(
+            path,
+            config,
+            &|fd, c| applier(fd, c),
+            &|fd, line, level| setter(fd, line, level),
+        )?;
+        // Best-effort: a step failing after the open (e.g. IOSSIOSPEED's
+        // documented ENOTTY against a PTY, or an adapter with no modem
+        // lines) must not be treated as a failure to open — the device is
+        // still connected and recording raw bytes. It is not hidden either:
+        // the `config_change` recorded for this open says what failed.
+        if let Err(e) = &opened.termios {
+            eprintln!(
+                "serialwardend: port: baud/framing did not apply when opening {} (device is \
+                 still connected and recording): {e}",
+                id.0
+            );
+        }
+        if let Some(e) = &opened.control_lines {
+            eprintln!(
+                "serialwardend: port: DTR/RTS could not be asserted when opening {}: {e}",
+                id.0
+            );
+        }
+        if let Some(e) = &opened.nonblocking {
+            eprintln!(
+                "serialwardend: port: could not clear O_NONBLOCK when opening {}: {e}",
+                id.0
+            );
+        }
+        let port = PortApply::from_open(&opened.termios, opened.control_lines.as_ref());
+        Ok((opened.file, port))
     }
 
     /// Shared, thread-safe view of every device's [`Recorder`] this
@@ -1204,6 +1280,10 @@ impl HotplugDetector {
                 .expect("attempt_open is only called for a tracked device")
                 .recorder,
         );
+        // Held from reading the profile until the fd is published — see
+        // `LiveApply`'s docs for the window this closes.
+        let live_apply = Arc::clone(&self.live_apply);
+        let _serialized = live_apply.lock();
 
         // The config to apply is always this device's *current* live
         // profile — freshly loaded in `handle_new_device` for a brand-new
@@ -1222,28 +1302,8 @@ impl HotplugDetector {
                 .unwrap_or_default()
         };
 
-        match port_io::open_and_configure(&dev.path, &config) {
-            Ok((file, config_err)) => {
-                if let Some(e) = &config_err {
-                    // Best-effort: see `port_io`'s module docs for why a
-                    // config-application failure (e.g. IOSSIOSPEED's
-                    // documented, empirically-confirmed ENOTTY against a
-                    // PTY, or a fake test device that isn't a tty at all)
-                    // must not be treated the same as a failure to open
-                    // the device at all — the device is still connected
-                    // and still recording raw bytes either way. It is not
-                    // hidden either: the `config_change` below says
-                    // `applied: false` with this error.
-                    eprintln!(
-                        "serialwardend: port: config application for {} did not fully apply (device \
-                         is still connected and recording): {e}",
-                        id.0
-                    );
-                }
-                let port_apply = match &config_err {
-                    None => PortApply::live(),
-                    Some(e) => PortApply::failed(e),
-                };
+        match self.open_port(&id, &dev.path, &config) {
+            Ok((file, port_apply)) => {
                 if let Err(e) = append_connect_event(&recorder, &id, &dev.path, dev.usb.as_ref()) {
                     eprintln!(
                         "serialwardend: port: failed to append connect event for {}: {e}",
@@ -1611,13 +1671,8 @@ impl HotplugDetector {
         reason: &str,
     ) -> u64 {
         let duration_ms = lease.started.elapsed().as_millis() as u64;
-        if let Err(e) = self.reopen_after_lease(id) {
-            eprintln!(
-                "serialwardend: port: failed to reopen {} after its lease ended (will retry via \
-                 the normal reconnect path): {e}",
-                id.0
-            );
-        }
+        // `lease_end` first, then the reopen (which records the profile it
+        // applies): the timeline reads "lease over, port reopened at X".
         let recorder_and_path = {
             let path = self
                 .configs
@@ -1647,6 +1702,13 @@ impl HotplugDetector {
                 );
             }
         }
+        if let Err(e) = self.reopen_after_lease(id) {
+            eprintln!(
+                "serialwardend: port: failed to reopen {} after its lease ended (will retry via \
+                 the normal reconnect path): {e}",
+                id.0
+            );
+        }
         self.remove_persisted_lease(id);
         duration_ms
     }
@@ -1658,6 +1720,9 @@ impl HotplugDetector {
     /// the device was open at, which the caller hands off to whatever
     /// external process the lease is for.
     fn take_fd_for_lease(&mut self, id: &DeviceId) -> io::Result<PathBuf> {
+        // Not while a `set_config` is applying to the fd being handed off.
+        let live_apply = Arc::clone(&self.live_apply);
+        let _serialized = live_apply.lock();
         let Some(tracked) = self.tracked.get_mut(id) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1688,10 +1753,20 @@ impl HotplugDetector {
     /// Reverse of [`Self::take_fd_for_lease`]: reopen the device at its
     /// last-known path, re-arm a fresh reader thread, and restore
     /// `Connected` state — everything [`Self::attempt_open`]'s success path
-    /// does, *except* appending a `connect`/`config_change` event, since
-    /// (per the lease-vs-disconnect distinction the wiki draws) this is a
-    /// resumption, not a fresh connection.
+    /// does except appending a `connect` event, since (per the
+    /// lease-vs-disconnect distinction the wiki draws) this is a resumption,
+    /// not a fresh connection.
+    ///
+    /// It does record the profile it applied, as a `config_change` with
+    /// `changed_by: "system:lease_end"` and `old: null` — the same shape as
+    /// a connect's `system:connect` record, because it is the same act: a
+    /// freshly opened port gets the saved profile, which may or may not
+    /// take. Without it, a change saved during the lease stayed recorded as
+    /// "saved, not applied" even once this reopen applied it (or failed to).
+    /// The caller appends `lease_end` first, so this reads after it.
     fn reopen_after_lease(&mut self, id: &DeviceId) -> io::Result<()> {
+        let live_apply = Arc::clone(&self.live_apply);
+        let _serialized = live_apply.lock();
         let (path, config) = {
             let configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());
             let entry = configs.get(id).ok_or_else(|| {
@@ -1706,21 +1781,26 @@ impl HotplugDetector {
             (path, entry.profile.config.clone())
         };
 
-        let (file, config_err) = port_io::open_and_configure(&path, &config)?;
-        if let Some(e) = &config_err {
-            eprintln!(
-                "serialwardend: port: config application for {} did not fully apply after lease \
-                 release (device is still connected and recording): {e}",
-                id.0
-            );
-        }
-
         let Some(recorder) = self.tracked.get(id).map(|t| Arc::clone(&t.recorder)) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("unknown device {}", id.0),
             ));
         };
+
+        let (file, port_apply) = self.open_port(id, &path, &config)?;
+        if let Err(e) = device_profile::append_config_change_event(
+            &recorder,
+            None,
+            &config,
+            "system:lease_end",
+            &port_apply,
+        ) {
+            eprintln!(
+                "serialwardend: port: failed to append config_change event for {}: {e}",
+                id.0
+            );
+        }
 
         let file = Arc::new(file);
         if let Some(entry) = self
@@ -1730,7 +1810,7 @@ impl HotplugDetector {
             .get_mut(id)
         {
             entry.fd = Some(Arc::clone(&file));
-            entry.live_config = config_err.is_none().then_some(config);
+            entry.live_config = port_apply.applied().then_some(config);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -2144,11 +2224,7 @@ impl PortConfigApi {
         update: impl FnOnce(&PortConfig) -> io::Result<PortConfig>,
         changed_by: &str,
     ) -> io::Result<SetConfigOutcome> {
-        let _serialized = self
-            .live_apply
-            .serialize
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _serialized = self.live_apply.lock();
 
         let (old_config, new_config, changed, fd) = {
             let mut configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());

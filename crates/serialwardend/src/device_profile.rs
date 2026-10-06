@@ -34,7 +34,13 @@
 //!   (baud/data bits/parity/stop bits/flow control), with full old/new
 //!   values, `changed_by`, and whether the open port actually took it
 //!   (`applied`/`apply`/`apply_error`, see [`PortApply`]). Never recorded
-//!   for a request that changes nothing (issue #51).
+//!   for a request that changes nothing (issue #51). Every time the daemon
+//!   opens the port it records the profile it applied the same way, with
+//!   `old: null`: `changed_by: "system:connect"` on a (re)connect and
+//!   `"system:lease_end"` when it takes the port back after a lease. Those
+//!   open-time records also carry `control_line_error` when the profile
+//!   asserts DTR/RTS and the driver refused; `applied` is about baud and
+//!   framing only.
 //! - `config_reapplied` — the saved configuration did not change, but the
 //!   port was not known to be running it (an earlier live apply failed), so
 //!   the request retried the live apply. Recorded because it touched the
@@ -147,6 +153,12 @@ pub struct PortApply {
     pub apply: ConfigApply,
     /// The port's error, set exactly when `apply` is [`ConfigApply::Failed`].
     pub error: Option<String>,
+    /// Only for a port being opened in `open_control_lines: assert` mode:
+    /// the driver refused to set DTR/RTS. Kept apart from `apply`/`error`,
+    /// which are about baud and framing — a port with no modem lines can
+    /// run the requested line settings perfectly well (see
+    /// `port_io::OpenedPort`).
+    pub control_line_error: Option<String>,
 }
 
 impl PortApply {
@@ -154,6 +166,7 @@ impl PortApply {
         Self {
             apply: ConfigApply::Live,
             error: None,
+            control_line_error: None,
         }
     }
 
@@ -161,6 +174,7 @@ impl PortApply {
         Self {
             apply: ConfigApply::AlreadyApplied,
             error: None,
+            control_line_error: None,
         }
     }
 
@@ -168,6 +182,7 @@ impl PortApply {
         Self {
             apply: ConfigApply::NotConnected,
             error: None,
+            control_line_error: None,
         }
     }
 
@@ -175,7 +190,19 @@ impl PortApply {
         Self {
             apply: ConfigApply::Failed,
             error: Some(error.to_string()),
+            control_line_error: None,
         }
+    }
+
+    /// What opening a port did with `config`: the termios result decides
+    /// `apply`, and a DTR/RTS failure is carried on its own.
+    pub fn from_open(termios: &io::Result<()>, control_lines: Option<&io::Error>) -> Self {
+        let mut port = match termios {
+            Ok(()) => Self::live(),
+            Err(e) => Self::failed(e),
+        };
+        port.control_line_error = control_lines.map(|e| e.to_string());
+        port
     }
 
     pub fn applied(&self) -> bool {
@@ -196,6 +223,9 @@ impl PortApply {
         );
         if let Some(error) = &self.error {
             extra.insert("apply_error".to_string(), error.clone().into());
+        }
+        if let Some(error) = &self.control_line_error {
+            extra.insert("control_line_error".to_string(), error.clone().into());
         }
     }
 }

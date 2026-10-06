@@ -734,3 +734,339 @@ fn linux_real_ioctl_round_trip_accepts_74880_via_bother() {
         "CBAUD must read back as the BOTHER selector value after a real TCSETS2 call"
     );
 }
+
+// ---- Port-open records: lease end, the open window, DTR/RTS apart from baud ----
+
+/// Every event named `name` on `recorder`, in order.
+fn events_named(
+    recorder: &serialwardend::recorder::Recorder,
+    name: &str,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    recorder
+        .read_since(0, usize::MAX)
+        .unwrap()
+        .records
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Event { event, extra, .. } if event == name => Some(extra),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Event names on `recorder`, in order.
+fn event_names(recorder: &serialwardend::recorder::Recorder) -> Vec<String> {
+    recorder
+        .read_since(0, usize::MAX)
+        .unwrap()
+        .records
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Event { event, .. } => Some(event),
+            _ => None,
+        })
+        .collect()
+}
+
+fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !check() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    true
+}
+
+/// A detector running on its own thread over one PTY mock device, plus
+/// the device id. `detector` lets a test inject appliers first.
+fn spawn_one_device(
+    data_dir: &std::path::Path,
+    device: &MockDevice,
+    serial: &str,
+    detector: impl FnOnce(HotplugDetector) -> HotplugDetector,
+) -> (
+    serialwardend::port::DetectorHandle,
+    DeviceId,
+    ScriptedEnumerator,
+) {
+    let usb = UsbMetadata {
+        vid: 0x067b,
+        pid: 0x2303,
+        serial_number: Some(serial.to_string()),
+    };
+    let id = DeviceId::from_usb(&usb).expect("usb id");
+    let enumerator = ScriptedEnumerator::new();
+    enumerator.push(EnumeratedDevice {
+        path: device.slave_path().to_path_buf(),
+        usb: Some(usb),
+    });
+    let handle = detector(HotplugDetector::new(
+        Box::new(enumerator.clone()),
+        data_dir.to_path_buf(),
+        tiny_poll_config(),
+    ))
+    .spawn();
+    (handle, id, enumerator)
+}
+
+/// Ending a lease reopens the port with the saved profile. That is recorded
+/// like a connect's profile application (`config_change`, `old: null`), as
+/// `system:lease_end`, after `lease_end`, saying whether it took. A change
+/// saved during the lease was recorded "not applied"; this is the record
+/// that says what then happened to it.
+#[test]
+fn ending_a_lease_records_the_profile_it_reopened_with_and_whether_it_took() {
+    use serialwardend::port::LiveConfigApplier;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let device = MockDevice::new().expect("open mock device");
+    let fail = Arc::new(AtomicBool::new(false));
+    let fail_in_applier = Arc::clone(&fail);
+    let applier: LiveConfigApplier = Arc::new(move |_fd, _config| {
+        if fail_in_applier.load(Ordering::SeqCst) {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        } else {
+            Ok(())
+        }
+    });
+    let (handle, id, _enumerator) =
+        spawn_one_device(&tmp.path().join("data"), &device, "LEASE-END", |d| {
+            d.with_live_config_applier(applier)
+        });
+    let api = handle.port_config_api();
+    assert!(
+        wait_for(Duration::from_secs(5), || api
+            .list_devices()
+            .iter()
+            .any(|d| d.id == id && d.connected)),
+        "device never connected"
+    );
+    let recorder = Arc::clone(handle.recorders().lock().unwrap().get(&id).unwrap());
+
+    // A lease the port reopens from cleanly.
+    let lease = api
+        .acquire_lease(&id, "true", std::process::id(), None)
+        .expect("acquire");
+    api.release_lease(&lease.token, 0).expect("release");
+    let reopened = events_named(&recorder, "config_change")
+        .into_iter()
+        .filter(|e| e["changed_by"] == "system:lease_end")
+        .collect::<Vec<_>>();
+    assert_eq!(reopened.len(), 1, "{reopened:?}");
+    assert!(reopened[0]["old"].is_null());
+    assert_eq!(reopened[0]["new"]["baud"], 9600);
+    assert_eq!(reopened[0]["applied"], true);
+    assert_eq!(reopened[0]["apply"], "live");
+
+    // A change saved during the next lease, and a port that refuses it.
+    let lease = api
+        .acquire_lease(&id, "true", std::process::id(), None)
+        .expect("acquire again");
+    let saved = api
+        .set_port_config(
+            &id,
+            PortConfig {
+                baud: 74_880,
+                ..PortConfig::default()
+            },
+            "test:during-lease",
+        )
+        .expect("set during lease");
+    assert_eq!(saved.port.apply, warden_proto::ConfigApply::NotConnected);
+    fail.store(true, Ordering::SeqCst);
+    api.release_lease(&lease.token, 0).expect("release again");
+
+    let names = event_names(&recorder);
+    let last_two = &names[names.len() - 2..];
+    assert_eq!(
+        last_two,
+        ["lease_end", "config_change"],
+        "the reopen is recorded after lease_end: {names:?}"
+    );
+    let last = events_named(&recorder, "config_change").pop().unwrap();
+    assert_eq!(last["changed_by"], "system:lease_end");
+    assert_eq!(last["new"]["baud"], 74_880);
+    assert_eq!(last["applied"], false);
+    assert_eq!(last["apply"], "failed");
+    assert!(
+        last["apply_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("Invalid argument")),
+        "{last:?}"
+    );
+
+    handle.stop();
+}
+
+/// A `set_config` arriving while the daemon is opening the port must not be
+/// told "not connected" (and recorded that way) while the port comes up on
+/// the previous profile. It waits for the open, then applies live.
+#[test]
+fn a_set_config_during_the_open_waits_for_it_and_applies_live() {
+    use serialwardend::port::LiveConfigApplier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Mutex};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let device = MockDevice::new().expect("open mock device");
+    // The first application is the open's: it reports that it has started,
+    // then holds the open in progress until the test lets it go.
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let entered_tx = Mutex::new(entered_tx);
+    let release_rx = Mutex::new(release_rx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_in_applier = Arc::clone(&calls);
+    let applier: LiveConfigApplier = Arc::new(move |_fd, _config| {
+        if calls_in_applier.fetch_add(1, Ordering::SeqCst) == 0 {
+            entered_tx.lock().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+        Ok(())
+    });
+    let (handle, id, _enumerator) =
+        spawn_one_device(&tmp.path().join("data"), &device, "OPEN-WINDOW", |d| {
+            d.with_live_config_applier(applier)
+        });
+    let api = handle.port_config_api();
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the open never applied the profile");
+
+    // The port is open but the open has not finished: the window.
+    let api_in_thread = api.clone();
+    let id_in_thread = id.clone();
+    let setter = thread::spawn(move || {
+        api_in_thread.set_port_config(
+            &id_in_thread,
+            PortConfig {
+                baud: 115_200,
+                ..PortConfig::default()
+            },
+            "test:window",
+        )
+    });
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !setter.is_finished(),
+        "set_config must wait for the open in progress, not report not_connected"
+    );
+
+    release_tx.send(()).unwrap();
+    let outcome = setter.join().unwrap().expect("set_port_config");
+    assert_eq!(outcome.port.apply, warden_proto::ConfigApply::Live);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "open, then the live apply");
+
+    let recorder = Arc::clone(handle.recorders().lock().unwrap().get(&id).unwrap());
+    let changes = events_named(&recorder, "config_change");
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    assert_eq!(changes[0]["changed_by"], "system:connect");
+    assert_eq!(changes[0]["new"]["baud"], 9600);
+    assert_eq!(changes[1]["changed_by"], "test:window");
+    assert_eq!(changes[1]["applied"], true);
+
+    handle.stop();
+}
+
+/// Opening in DTR/RTS `assert` mode on an adapter that refuses the lines
+/// must not report the baud as failed: `applied` is about baud/framing, and
+/// the refusal gets its own `control_line_error`.
+#[test]
+fn a_dtr_rts_refusal_on_open_is_recorded_apart_from_the_applied_baud() {
+    use serialwardend::port::{ControlLineSetter, LiveConfigApplier};
+    use serialwardend::port_config::OpenControlLines;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut device = MockDevice::new().expect("open mock device");
+    let old_path = device.slave_path().to_path_buf();
+    let applier: LiveConfigApplier = Arc::new(|_fd, _config| Ok(()));
+    let setter: ControlLineSetter =
+        Arc::new(|_fd, _line, _level| Err(io::Error::from_raw_os_error(libc::ENOTTY)));
+    let (handle, id, enumerator) =
+        spawn_one_device(&tmp.path().join("data"), &device, "NO-MODEM-LINES", |d| {
+            d.with_live_config_applier(applier)
+                .with_open_control_line_setter(setter)
+        });
+    let api = handle.port_config_api();
+    assert!(
+        wait_for(Duration::from_secs(5), || api
+            .list_devices()
+            .iter()
+            .any(|d| d.id == id && d.connected)),
+        "device never connected"
+    );
+    let recorder = Arc::clone(handle.recorders().lock().unwrap().get(&id).unwrap());
+
+    // Preserve mode touches no lines, so the first open has nothing to refuse.
+    let first = events_named(&recorder, "config_change").pop().unwrap();
+    assert_eq!(first["applied"], true);
+    assert!(!first.contains_key("control_line_error"), "{first:?}");
+
+    api.set_port_config(
+        &id,
+        PortConfig {
+            baud: 74_880,
+            open_control_lines: OpenControlLines::Assert {
+                dtr: true,
+                rts: true,
+            },
+            ..PortConfig::default()
+        },
+        "test:assert",
+    )
+    .expect("set assert mode");
+
+    device.disconnect().expect("disconnect");
+    assert!(
+        wait_for(Duration::from_secs(5), || !events_named(
+            &recorder,
+            "disconnect"
+        )
+        .is_empty()),
+        "expected a disconnect"
+    );
+    device.reconnect().expect("reconnect");
+    enumerator.replace_path(&old_path, device.slave_path().to_path_buf());
+    assert!(
+        wait_for(Duration::from_secs(5), || events_named(
+            &recorder, "connect"
+        )
+        .len()
+            == 2),
+        "expected a reconnect"
+    );
+    let reconnect = events_named(&recorder, "config_change").pop().unwrap();
+    assert_eq!(reconnect["changed_by"], "system:connect");
+    assert_eq!(reconnect["new"]["baud"], 74_880);
+    assert_eq!(reconnect["applied"], true, "the baud took: {reconnect:?}");
+    assert_eq!(reconnect["apply"], "live");
+    assert!(!reconnect.contains_key("apply_error"), "{reconnect:?}");
+    assert!(
+        reconnect["control_line_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("Inappropriate ioctl")),
+        "{reconnect:?}"
+    );
+
+    // And the port is known to run the profile, so repeating it is a no-op.
+    let again = api
+        .set_port_config(
+            &id,
+            PortConfig {
+                baud: 74_880,
+                open_control_lines: OpenControlLines::Assert {
+                    dtr: true,
+                    rts: true,
+                },
+                ..PortConfig::default()
+            },
+            "test:assert",
+        )
+        .unwrap();
+    assert_eq!(again.port.apply, warden_proto::ConfigApply::AlreadyApplied);
+
+    handle.stop();
+}

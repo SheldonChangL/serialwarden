@@ -382,6 +382,43 @@ pub mod testing {
             ) {
                 eprintln!("TestBackend: failed to append lease_end (timeout) event: {e}");
             }
+            self.reopen_after_lease(id);
+        }
+
+        /// Mirrors `port::HotplugDetector::reopen_after_lease`'s record: the
+        /// saved profile "applied" to the reopened port (failing if
+        /// [`Self::fail_live_apply`] says so), as a `config_change` with
+        /// `changed_by: "system:lease_end"` and `old: null`, after
+        /// `lease_end`.
+        fn reopen_after_lease(&self, id: &DeviceId) {
+            use crate::device_profile::PortApply;
+
+            let live_apply_error = self
+                .live_apply_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let (recorder, config, port) = {
+                let mut devices = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(entry) = devices.get_mut(id) else {
+                    return;
+                };
+                let port = match live_apply_error {
+                    None => PortApply::live(),
+                    Some(e) => PortApply::failed(e),
+                };
+                entry.live_config = port.applied().then(|| entry.config.clone());
+                (Arc::clone(&entry.recorder), entry.config.clone(), port)
+            };
+            if let Err(e) = crate::device_profile::append_config_change_event(
+                &recorder,
+                None,
+                &config,
+                "system:lease_end",
+                &port,
+            ) {
+                eprintln!("TestBackend: failed to append config_change (lease_end) event: {e}");
+            }
         }
     }
 
@@ -639,6 +676,7 @@ pub mod testing {
             ) {
                 eprintln!("TestBackend: failed to append lease_end event: {e}");
             }
+            self.reopen_after_lease(&id);
             Ok(LeaseReleased { duration_ms })
         }
     }
