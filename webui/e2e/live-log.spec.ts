@@ -184,6 +184,18 @@ test("sending from the write bar returns focus to the entry for the next command
   await expect(input).toBeFocused();
 });
 
+test("the write bar ends lines with CR by default and remembers a change per device", async ({
+  page,
+}) => {
+  await gotoConnectedLiveLog(page);
+  const ending = page.getByTestId("write-line-ending");
+  await expect(ending).toHaveValue("cr");
+
+  await ending.selectOption("crlf");
+  await page.reload();
+  await expect(page.getByTestId("write-line-ending")).toHaveValue("crlf", { timeout: 10_000 });
+});
+
 test("Tab completes paths harvested from device output, shell-style", async ({ page }) => {
   await gotoConnectedLiveLog(page);
   await injectLog(daemon!, DEVICE_ID, [

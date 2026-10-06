@@ -14,6 +14,10 @@
    *   board that wants `CRLF` looks exactly like the board ignoring you, and
    *   it is the single most common way a serial session wastes ten minutes.
    *   It sits next to Send, at the size of a thing you are expected to check.
+   *   It starts at CR, which is what interactive firmware consoles most often
+   *   act on, and once changed it is remembered per device in this browser:
+   *   a board's console doesn't change its mind between sessions, so neither
+   *   should the control.
    * - **HEX mode parses in the browser.** The daemon's write endpoint takes
    *   text-or-base64 exactly like its UDS counterpart; keeping hex parsing
    *   here means the daemon has one byte-decoding path, not two.
@@ -34,7 +38,34 @@
 
   let value = $state("");
   let mode = $state<Mode>("text");
-  let lineEnding = $state<LineEnding>("lf");
+  const LINE_ENDINGS: readonly LineEnding[] = ["lf", "crlf", "cr", "none"];
+  const DEFAULT_LINE_ENDING: LineEnding = "cr";
+  const lineEndingKey = (id: string) => `serialwarden.lineEnding.${id}`;
+
+  // Browser storage can be unavailable (private windows, blocked site data);
+  // the bar must still work, just without remembering.
+  function loadLineEnding(id: string): LineEnding {
+    try {
+      const saved = localStorage.getItem(lineEndingKey(id));
+      if (saved && (LINE_ENDINGS as readonly string[]).includes(saved)) return saved as LineEnding;
+    } catch {
+      // fall through to the default
+    }
+    return DEFAULT_LINE_ENDING;
+  }
+
+  function saveLineEnding(): void {
+    try {
+      localStorage.setItem(lineEndingKey(deviceId), lineEnding);
+    } catch {
+      // not remembered this time; the choice still applies to this session
+    }
+  }
+
+  // The subtree is keyed on the device id (see below), so reading once at
+  // mount is enough.
+  // svelte-ignore state_referenced_locally
+  let lineEnding = $state<LineEnding>(loadLineEnding(deviceId));
   let sending = $state(false);
   let error = $state<string | null>(null);
   let inputEl: HTMLInputElement | undefined = $state();
@@ -279,6 +310,7 @@
     <select
       data-testid="write-line-ending"
       bind:value={lineEnding}
+      onchange={saveLineEnding}
       disabled={mode === "hex"}
       title={mode === "hex" ? "Hex is sent exactly as typed, with nothing appended" : undefined}
     >
