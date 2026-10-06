@@ -97,6 +97,22 @@ pub trait DeviceBackend: Send + Sync {
     fn release_lease(&self, token: &str, exit_code: i32) -> Result<LeaseReleased, LeaseError>;
 }
 
+/// Run a [`DeviceBackend`] call that can block on device I/O off the async
+/// workers, and await it. `set_config`, `set_control_line` and `dtr_pulse`
+/// issue ioctls that a wedged USB adapter can hold for seconds (and
+/// `dtr_pulse` sleeps for its pulse); the lease calls wait on the poll
+/// thread. Called directly from an `async fn`, a few of those in flight pin
+/// every tokio worker and starve the UDS, web and SSE tasks.
+pub async fn run_blocking<T: Send + 'static>(
+    backend: &Arc<dyn DeviceBackend>,
+    call: impl FnOnce(&dyn DeviceBackend) -> T + Send + 'static,
+) -> T {
+    let backend = Arc::clone(backend);
+    tokio::task::spawn_blocking(move || call(backend.as_ref()))
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+}
+
 /// Merge a partial JSON config patch onto `current`, producing a new,
 /// fully-specified [`PortConfig`]. Implemented via a JSON round trip
 /// (serialize `current`, overwrite matching keys from `patch`, deserialize
@@ -274,6 +290,9 @@ pub mod testing {
         /// When set, every live apply `set_config` attempts fails with this
         /// message — see [`Self::fail_live_apply`].
         live_apply_error: Mutex<Option<String>>,
+        /// When set, the port cannot be reopened when a lease ends — see
+        /// [`Self::fail_reopen_after_lease`].
+        reopen_fails: std::sync::atomic::AtomicBool,
     }
 
     impl TestBackend {
@@ -291,6 +310,14 @@ pub mod testing {
                 .live_apply_error
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = error;
+        }
+
+        /// Make reopening the port at the end of a lease fail (or succeed
+        /// again), as when the device was unplugged mid-lease. Like the real
+        /// detector, the device then stays disconnected and nothing about a
+        /// reopen is recorded.
+        pub fn fail_reopen_after_lease(&self, fail: bool) {
+            self.reopen_fails.store(fail, Ordering::SeqCst);
         }
 
         /// Register `recorder` as device `id`, connected, with the default
@@ -365,7 +392,6 @@ pub mod testing {
                     return;
                 }
                 let lease = entry.lease.take().expect("checked above");
-                entry.connected = true;
                 (Arc::clone(&entry.recorder), lease, entry.path.clone())
             };
             let duration_ms = lease.started.elapsed().as_millis() as u64;
@@ -385,12 +411,17 @@ pub mod testing {
             self.reopen_after_lease(id);
         }
 
-        /// Mirrors `port::HotplugDetector::reopen_after_lease`'s record: the
-        /// saved profile "applied" to the reopened port (failing if
-        /// [`Self::fail_live_apply`] says so), as a `config_change` with
-        /// `changed_by: "system:lease_end"` and `old: null`, after
-        /// `lease_end`.
+        /// Mirrors `port::HotplugDetector::reopen_after_lease`: unless
+        /// [`Self::fail_reopen_after_lease`] says the reopen fails (device
+        /// stays disconnected, nothing recorded), the device is connected
+        /// again and the saved profile "applied" to it (failing if
+        /// [`Self::fail_live_apply`] says so) is recorded as a
+        /// `config_change` with `changed_by: "system:lease_end"` and
+        /// `old: null`, after `lease_end`.
         fn reopen_after_lease(&self, id: &DeviceId) {
+            if self.reopen_fails.load(Ordering::SeqCst) {
+                return;
+            }
             use crate::device_profile::PortApply;
 
             let live_apply_error = self
@@ -403,6 +434,7 @@ pub mod testing {
                 let Some(entry) = devices.get_mut(id) else {
                     return;
                 };
+                entry.connected = true;
                 let port = match live_apply_error {
                     None => PortApply::live(),
                     Some(e) => PortApply::failed(e),
@@ -659,7 +691,6 @@ pub mod testing {
                     .ok_or(LeaseError::UnknownToken)?;
                 let entry = devices.get_mut(&id).expect("found by the search above");
                 let lease = entry.lease.take().expect("found by the search above");
-                entry.connected = true;
                 (id, Arc::clone(&entry.recorder), lease, entry.path.clone())
             };
             let duration_ms = lease.started.elapsed().as_millis() as u64;
@@ -686,6 +717,61 @@ pub mod testing {
 mod tests {
     use super::*;
     use crate::port_config::{DataBits, PortConfig};
+
+    fn event_names(recorder: &Recorder) -> Vec<String> {
+        recorder
+            .read_since(0, usize::MAX)
+            .unwrap()
+            .records
+            .into_iter()
+            .filter_map(|r| match r {
+                warden_proto::Record::Event { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Like the real detector: a lease end whose reopen succeeds records the
+    /// profile it applied after `lease_end`; one whose reopen fails leaves the
+    /// device disconnected and records no reopen at all.
+    #[test]
+    fn test_backend_records_a_lease_end_reopen_only_when_the_reopen_happens() {
+        use testing::TestBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            Recorder::open(
+                tmp.path(),
+                "dev",
+                crate::recorder::RecorderConfig::default(),
+            )
+            .unwrap(),
+        );
+        let backend = TestBackend::new();
+        let id = DeviceId("dev".to_string());
+        backend.register(id.clone(), Arc::clone(&recorder));
+        let connected =
+            |b: &TestBackend| b.list_devices().iter().any(|d| d.id == id && d.connected);
+
+        let lease = backend.acquire_lease(&id, "true", 1, None).unwrap();
+        backend.release_lease(&lease.token, 0).unwrap();
+        assert!(connected(&backend));
+        let names = event_names(&recorder);
+        assert_eq!(names[names.len() - 2..], ["lease_end", "config_change"]);
+
+        backend.fail_reopen_after_lease(true);
+        let lease = backend.acquire_lease(&id, "true", 1, None).unwrap();
+        backend.release_lease(&lease.token, 0).unwrap();
+        assert!(
+            !connected(&backend),
+            "a failed reopen leaves it disconnected"
+        );
+        assert_eq!(
+            event_names(&recorder).last().map(String::as_str),
+            Some("lease_end"),
+            "and records no reopen"
+        );
+    }
 
     #[test]
     fn merge_config_patch_overwrites_only_named_fields() {

@@ -39,8 +39,9 @@
 //!   `old: null`: `changed_by: "system:connect"` on a (re)connect and
 //!   `"system:lease_end"` when it takes the port back after a lease. Those
 //!   open-time records also carry `control_line_error` when the profile
-//!   asserts DTR/RTS and the driver refused; `applied` is about baud and
-//!   framing only.
+//!   asserts DTR/RTS and the driver refused, and `nonblocking_error` when
+//!   the port could not be switched back to blocking I/O; `applied` is
+//!   about baud and framing only.
 //! - `config_reapplied` — the saved configuration did not change, but the
 //!   port was not known to be running it (an earlier live apply failed), so
 //!   the request retried the live apply. Recorded because it touched the
@@ -159,6 +160,10 @@ pub struct PortApply {
     /// run the requested line settings perfectly well (see
     /// `port_io::OpenedPort`).
     pub control_line_error: Option<String>,
+    /// Only for a port being opened: clearing `O_NONBLOCK` failed, so writes
+    /// to it can fail with `WouldBlock` instead of waiting. Not a baud or
+    /// framing fact either, so also kept out of `apply`.
+    pub nonblocking_error: Option<String>,
 }
 
 impl PortApply {
@@ -167,6 +172,7 @@ impl PortApply {
             apply: ConfigApply::Live,
             error: None,
             control_line_error: None,
+            nonblocking_error: None,
         }
     }
 
@@ -175,6 +181,7 @@ impl PortApply {
             apply: ConfigApply::AlreadyApplied,
             error: None,
             control_line_error: None,
+            nonblocking_error: None,
         }
     }
 
@@ -183,6 +190,7 @@ impl PortApply {
             apply: ConfigApply::NotConnected,
             error: None,
             control_line_error: None,
+            nonblocking_error: None,
         }
     }
 
@@ -191,17 +199,23 @@ impl PortApply {
             apply: ConfigApply::Failed,
             error: Some(error.to_string()),
             control_line_error: None,
+            nonblocking_error: None,
         }
     }
 
     /// What opening a port did with `config`: the termios result decides
     /// `apply`, and a DTR/RTS failure is carried on its own.
-    pub fn from_open(termios: &io::Result<()>, control_lines: Option<&io::Error>) -> Self {
+    pub fn from_open(
+        termios: &io::Result<()>,
+        control_lines: Option<&io::Error>,
+        nonblocking: Option<&io::Error>,
+    ) -> Self {
         let mut port = match termios {
             Ok(()) => Self::live(),
             Err(e) => Self::failed(e),
         };
         port.control_line_error = control_lines.map(|e| e.to_string());
+        port.nonblocking_error = nonblocking.map(|e| e.to_string());
         port
     }
 
@@ -226,6 +240,9 @@ impl PortApply {
         }
         if let Some(error) = &self.control_line_error {
             extra.insert("control_line_error".to_string(), error.clone().into());
+        }
+        if let Some(error) = &self.nonblocking_error {
+            extra.insert("nonblocking_error".to_string(), error.clone().into());
         }
     }
 }
@@ -669,6 +686,32 @@ mod tests {
         assert_eq!(events[0].0, "config_reapplied");
         assert_eq!(events[0].1["applied"], true);
         assert_eq!(events[0].1["config"]["baud"], 74_880);
+    }
+
+    /// An open whose baud took but whose port stayed non-blocking records
+    /// both facts: `applied: true`, plus `nonblocking_error` (writes can
+    /// then fail with `WouldBlock`).
+    #[test]
+    fn an_open_that_left_the_port_nonblocking_records_it_apart_from_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = Recorder::open(tmp.path(), "dev", RecorderConfig::default()).unwrap();
+        let port = PortApply::from_open(
+            &Ok(()),
+            None,
+            Some(&io::Error::from_raw_os_error(libc::EBADF)),
+        );
+        append_config_change_event(
+            &recorder,
+            None,
+            &PortConfig::default(),
+            "system:connect",
+            &port,
+        )
+        .unwrap();
+        let events = events(&recorder);
+        assert_eq!(events[0].1["applied"], true);
+        assert!(events[0].1["nonblocking_error"].is_string(), "{events:?}");
+        assert!(!events[0].1.contains_key("control_line_error"));
     }
 
     #[test]

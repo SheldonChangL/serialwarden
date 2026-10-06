@@ -138,9 +138,16 @@ function notApplied(extra: Extra): { summary: string; detail: string } | null {
   if (extra.apply === "not_connected") {
     return { summary: "saved, applies when the port next opens", detail: "port not open (device disconnected or leased)" };
   }
+  // What the port runs instead depends on who applied it: a port the
+  // daemon just took back from a lease keeps whatever the lease's tool
+  // left it at, not "the previous settings" the timeline last showed.
+  const instead =
+    extra.changed_by === "system:lease_end"
+      ? "running whatever settings the lease's tool left until the device reconnects"
+      : "still running the previous settings until it reconnects";
   return {
     summary: "saved, NOT applied to the port",
-    detail: `port rejected it: ${str(extra.apply_error) ?? "unknown error"} · still running the previous settings until it reconnects`,
+    detail: `port rejected it: ${str(extra.apply_error) ?? "unknown error"} · ${instead}`,
   };
 }
 
@@ -164,16 +171,20 @@ function describeConfigChange(extra: Extra): EventDescription {
     // baud and framing took; that is its own fact, not a failed apply.
     const lineError = str(extra.control_line_error);
     const lines = lineError ? `DTR/RTS not set: ${lineError}` : null;
+    // Same for a port left non-blocking: writes to it can fail outright.
+    const nonblockingError = str(extra.nonblocking_error);
+    const nonblocking = nonblockingError ? `writes may not wait: ${nonblockingError}` : null;
     if (!failed) {
+      const caveat = lines ? "DTR/RTS not set" : nonblocking ? "writes may not wait" : null;
       return {
-        summary: lines ? `${summary} — DTR/RTS not set` : summary,
-        detail: joinDetail(lines, by ? `by ${by}` : null),
-        tone: lines ? "warn" : "rx",
+        summary: caveat ? `${summary} — ${caveat}` : summary,
+        detail: joinDetail(lines, nonblocking, by ? `by ${by}` : null),
+        tone: caveat ? "warn" : "rx",
       };
     }
     return {
       summary: `${summary} — ${failed.summary}`,
-      detail: joinDetail(failed.detail, lines, by ? `by ${by}` : null),
+      detail: joinDetail(failed.detail, lines, nonblocking, by ? `by ${by}` : null),
       tone: "gate",
     };
   }

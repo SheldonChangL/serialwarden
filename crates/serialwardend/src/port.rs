@@ -882,20 +882,28 @@ pub type LiveConfigApplier = Arc<dyn Fn(RawFd, &PortConfig) -> io::Result<()> + 
 /// [`HotplugDetector::with_open_control_line_setter`].
 pub type ControlLineSetter = Arc<dyn Fn(RawFd, ControlLine, bool) -> io::Result<()> + Send + Sync>;
 
-/// Everything that applies a configuration to the port, and the lock that
-/// orders those applications. The lock is held for a whole
-/// `set_port_config` call *and* for the whole of opening the port (reading
-/// the profile, opening, applying, recording, publishing the fd), and for
-/// handing the port to a lease. So a `set_config` either finishes before an
-/// open starts (and that open applies what it saved) or starts after the
-/// open has published its fd (and applies live). Without it, a request in
-/// the window between "port opened" and "fd published" saw no fd, recorded
-/// `not_connected`, and the port came up running the previous profile.
-/// It also keeps two concurrent `set_port_config` calls from interleaving.
+/// Everything that applies a configuration to the port, and the per-device
+/// locks that order those applications. A device's lock is held for a whole
+/// `set_port_config` call on it *and* for the whole of opening its port
+/// (reading the profile, opening, applying, recording, publishing the fd),
+/// and for handing its port to a lease. So a `set_config` either finishes
+/// before an open starts (and that open applies what it saved) or starts
+/// after the open has published its fd (and applies live). Without it, a
+/// request in the window between "port opened" and "fd published" saw no fd,
+/// recorded `not_connected`, and the port came up running the previous
+/// profile. It also keeps two concurrent `set_port_config` calls on one
+/// device from interleaving.
+///
+/// Per device, not one lock for the detector: the race is per device, and a
+/// live apply against a wedged USB adapter can sit in its ioctl for seconds
+/// (Linux `usb_control_msg` times out at 5 s, possibly more than once). With
+/// one global lock that stalled every other device's hotplug, disconnect
+/// handling and leases behind one caller, and a slow open of one device
+/// stalled `set_config` on all the others.
 struct LiveApply {
     applier: LiveConfigApplier,
     control_line_setter: ControlLineSetter,
-    serialize: Mutex<()>,
+    device_locks: Mutex<HashMap<DeviceId, Arc<Mutex<()>>>>,
 }
 
 impl LiveApply {
@@ -903,13 +911,25 @@ impl LiveApply {
         Arc::new(Self {
             applier,
             control_line_setter,
-            serialize: Mutex::new(()),
+            device_locks: Mutex::new(HashMap::new()),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.serialize.lock().unwrap_or_else(|e| e.into_inner())
+    /// `id`'s lock; take it with [`lock_device`]. The map lock itself is held
+    /// only to look the entry up, never across any device I/O.
+    fn device_lock(&self, id: &DeviceId) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.device_locks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(id.clone())
+                .or_default(),
+        )
     }
+}
+
+fn lock_device(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Polls a [`DeviceEnumerator`] and drives the connect/disconnect/
@@ -1042,7 +1062,11 @@ impl HotplugDetector {
                 id.0
             );
         }
-        let port = PortApply::from_open(&opened.termios, opened.control_lines.as_ref());
+        let port = PortApply::from_open(
+            &opened.termios,
+            opened.control_lines.as_ref(),
+            opened.nonblocking.as_ref(),
+        );
         Ok((opened.file, port))
     }
 
@@ -1282,8 +1306,8 @@ impl HotplugDetector {
         );
         // Held from reading the profile until the fd is published — see
         // `LiveApply`'s docs for the window this closes.
-        let live_apply = Arc::clone(&self.live_apply);
-        let _serialized = live_apply.lock();
+        let device_lock = self.live_apply.device_lock(&id);
+        let _serialized = lock_device(&device_lock);
 
         // The config to apply is always this device's *current* live
         // profile — freshly loaded in `handle_new_device` for a brand-new
@@ -1721,8 +1745,8 @@ impl HotplugDetector {
     /// external process the lease is for.
     fn take_fd_for_lease(&mut self, id: &DeviceId) -> io::Result<PathBuf> {
         // Not while a `set_config` is applying to the fd being handed off.
-        let live_apply = Arc::clone(&self.live_apply);
-        let _serialized = live_apply.lock();
+        let device_lock = self.live_apply.device_lock(id);
+        let _serialized = lock_device(&device_lock);
         let Some(tracked) = self.tracked.get_mut(id) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1765,8 +1789,8 @@ impl HotplugDetector {
     /// "saved, not applied" even once this reopen applied it (or failed to).
     /// The caller appends `lease_end` first, so this reads after it.
     fn reopen_after_lease(&mut self, id: &DeviceId) -> io::Result<()> {
-        let live_apply = Arc::clone(&self.live_apply);
-        let _serialized = live_apply.lock();
+        let device_lock = self.live_apply.device_lock(id);
+        let _serialized = lock_device(&device_lock);
         let (path, config) = {
             let configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());
             let entry = configs.get(id).ok_or_else(|| {
@@ -2224,7 +2248,8 @@ impl PortConfigApi {
         update: impl FnOnce(&PortConfig) -> io::Result<PortConfig>,
         changed_by: &str,
     ) -> io::Result<SetConfigOutcome> {
-        let _serialized = self.live_apply.lock();
+        let device_lock = self.live_apply.device_lock(id);
+        let _serialized = lock_device(&device_lock);
 
         let (old_config, new_config, changed, fd) = {
             let mut configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());

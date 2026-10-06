@@ -1070,3 +1070,89 @@ fn a_dtr_rts_refusal_on_open_is_recorded_apart_from_the_applied_baud() {
 
     handle.stop();
 }
+
+/// The apply lock is per device: a live apply stuck in a wedged adapter's
+/// ioctl on device B (seconds, on Linux USB) must not hold up opening
+/// device A — or hotplug, disconnects and leases for every other device.
+#[test]
+fn a_stalled_live_apply_on_one_device_does_not_block_opening_another() {
+    use serialwardend::port::LiveConfigApplier;
+    use std::sync::{mpsc, Mutex};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let device_a = MockDevice::new().expect("open mock device A");
+    let device_b = MockDevice::new().expect("open mock device B");
+    let usb = |serial: &str| UsbMetadata {
+        vid: 0x067b,
+        pid: 0x2303,
+        serial_number: Some(serial.to_string()),
+    };
+    let (usb_a, usb_b) = (usb("STALL-A"), usb("STALL-B"));
+    let id_a = DeviceId::from_usb(&usb_a).expect("usb id");
+    let id_b = DeviceId::from_usb(&usb_b).expect("usb id");
+    let enumerator = ScriptedEnumerator::new();
+    enumerator.push(EnumeratedDevice {
+        path: device_b.slave_path().to_path_buf(),
+        usb: Some(usb_b),
+    });
+
+    // Only B's 74880 request stalls: it reports that it is stuck, then
+    // waits until the test lets it go.
+    let (stalled_tx, stalled_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let stalled_tx = Mutex::new(stalled_tx);
+    let release_rx = Mutex::new(release_rx);
+    let applier: LiveConfigApplier = Arc::new(move |_fd, config| {
+        if config.baud == 74_880 {
+            stalled_tx.lock().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+        Ok(())
+    });
+    let handle = HotplugDetector::new(
+        Box::new(enumerator.clone()),
+        tmp.path().join("data"),
+        tiny_poll_config(),
+    )
+    .with_live_config_applier(applier)
+    .spawn();
+    let api = handle.port_config_api();
+    let connected = |id: &DeviceId| {
+        api.list_devices()
+            .iter()
+            .any(|d| &d.id == id && d.connected)
+    };
+    assert!(
+        wait_for(Duration::from_secs(5), || connected(&id_b)),
+        "device B never connected"
+    );
+
+    let api_in_thread = api.clone();
+    let id_b_in_thread = id_b.clone();
+    let stuck = thread::spawn(move || {
+        api_in_thread.set_port_config(
+            &id_b_in_thread,
+            PortConfig {
+                baud: 74_880,
+                ..PortConfig::default()
+            },
+            "test:stalled",
+        )
+    });
+    stalled_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("B's live apply never started");
+
+    // B's apply is stuck holding B's lock. A appears now and must open.
+    enumerator.push(EnumeratedDevice {
+        path: device_a.slave_path().to_path_buf(),
+        usb: Some(usb_a),
+    });
+    let opened = wait_for(Duration::from_secs(5), || connected(&id_a));
+    release_tx.send(()).unwrap();
+    assert!(opened, "device A's open waited on device B's stalled apply");
+
+    let outcome = stuck.join().unwrap().expect("B's set_port_config");
+    assert_eq!(outcome.port.apply, warden_proto::ConfigApply::Live);
+    handle.stop();
+}
