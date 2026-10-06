@@ -1,6 +1,6 @@
 # Contributing to SerialWarden
 
-Bug reports from real boards and adapters are the most valuable contribution right now. The test suite runs against a PTY mock device, and several of the most important fixes so far came from real hardware doing something the mock didn't (see the README's "Tested against real hardware").
+Bug reports from real boards and adapters are the most valuable contribution right now. The test suite runs against a PTY mock device, and several of the most important fixes so far came from real hardware doing something the mock didn't (see the README's "Status").
 
 ## Reporting a hardware bug
 
