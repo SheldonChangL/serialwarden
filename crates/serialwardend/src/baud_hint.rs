@@ -349,8 +349,14 @@ impl EvidenceTracker {
             "lease_end" if self.port == PortState::Leased => self.port = PortState::Unknown,
             "config_change" => {
                 let new = baud_of(extra.get("new"));
-                if extra.get("changed_by").and_then(|v| v.as_str()) == Some("system:connect") {
+                // Every port open records one: `system:connect` after a
+                // `connect`, `system:lease_end` when the port reopens after
+                // a lease (often a flasher, so the firmware may differ).
+                // Either way, a fresh stretch of evidence at that rate.
+                let reopened_by = extra.get("changed_by").and_then(|v| v.as_str());
+                if matches!(reopened_by, Some("system:connect" | "system:lease_end")) {
                     self.reset(seq, new.filter(|_| applied));
+                    self.port = PortState::Open;
                     return;
                 }
                 if !applied {
@@ -1504,6 +1510,37 @@ mod tests {
         sim.connect(9600);
         let h = sim.health(9600);
         assert_eq!((h.port, h.connects), (PortState::Open, 2));
+    }
+
+    /// Since #75 a lease ends with `lease_end` and then a
+    /// `system:lease_end` `config_change` for the reopen (no `connect`).
+    #[test]
+    fn a_reopen_after_a_lease_starts_fresh_evidence_and_reads_as_open() {
+        let mut sim = Sim::new();
+        sim.connect(115_200);
+        for t in ISSUE_TEXT {
+            sim.text(t);
+        }
+        sim.texts(10);
+        sim.tracker.on_event(90, "lease_start", &Map::new());
+        sim.tracker.on_event(91, "lease_end", &Map::new());
+        sim.seq = 91;
+        let s = sim.next();
+        sim.tracker.on_event(
+            s,
+            "config_change",
+            &extra(&[
+                ("old", Value::Null),
+                ("new", json!({ "baud": 115_200 })),
+                ("changed_by", "system:lease_end".into()),
+                ("applied", true.into()),
+            ]),
+        );
+        sim.garbage(10);
+        let h = sim.health(115_200);
+        assert_eq!((h.port, h.connects), (PortState::Open, 1));
+        let s = h.suggestion.expect("suggestion");
+        assert!(s.fingerprint.is_none() && !s.mode_switch, "{s:?}");
     }
 
     #[test]
