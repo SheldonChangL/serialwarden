@@ -1,11 +1,11 @@
 # webui
 
-The serialwrap web GUI's frontend. Built with **TypeScript + Svelte 5 +
-Vite**, embedded into the single `serialwrap` binary via `rust-embed` (see
-`crates/serialwrapd/src/web/`) — there is no separate frontend server or
-`node_modules` dependency at runtime. `serialwrap daemon` alone is enough
+The serialwarden web GUI's frontend. Built with **TypeScript + Svelte 5 +
+Vite**, embedded into the single `serialwarden` binary via `rust-embed` (see
+`crates/serialwardend/src/web/`) — there is no separate frontend server or
+`node_modules` dependency at runtime. `serialwarden daemon` alone is enough
 for a browser at `http://127.0.0.1:5590` to work (see the [Client-protocol
-wiki](https://github.com/SheldonChangL/serialwrap/wiki/Client-protocol)).
+wiki](https://github.com/SheldonChangL/serialwarden/wiki/Client-protocol)).
 
 This is `TASKS.md` T5.1 (issue #18): the foundation only — WebSocket
 connectivity, an honest connection-status indicator, and one live API call
@@ -49,10 +49,10 @@ webui/
 
 ```sh
 npm ci
-npm run build        # -> dist/, embedded by `cargo build` (see crates/serialwrapd/build.rs)
+npm run build        # -> dist/, embedded by `cargo build` (see crates/serialwardend/build.rs)
 ```
 
-`crates/serialwrapd/build.rs` writes a minimal placeholder into `dist/` if
+`crates/serialwardend/build.rs` writes a minimal placeholder into `dist/` if
 it doesn't exist yet, so a Rust-only checkout can still `cargo build`/
 `cargo test` without Node installed — but the real UI needs an actual
 `npm run build` first. CI always runs the frontend build before any cargo
@@ -66,21 +66,21 @@ npm run check          # svelte-check + tsc (frontend and e2e/ sources)
 npm run lint           # eslint
 ```
 
-Run a `serialwrap daemon` separately (`SERIALWRAP_WEB_PORT` defaults to
+Run a `serialwarden daemon` separately (`SERIALWARDEN_WEB_PORT` defaults to
 `5590`) for `npm run dev`'s proxy to have something to talk to.
 
 ## E2E (Playwright)
 
 ```sh
 npx playwright install --with-deps chromium   # once
-npm run build && cargo build --release -p serialwrap    # from repo root
+npm run build && cargo build --release -p serialwarden    # from repo root
 npm run e2e
 ```
 
-`e2e/daemon.ts` spawns the actual compiled `serialwrap daemon` binary
-(default: `target/release/serialwrap`; override with `SERIALWRAP_BIN` or
-`SERIALWRAP_PROFILE=debug`) on a throwaway `HOME`/port per test, so it
-never touches a real user's `~/.serialwrap`. This suite is intentionally
+`e2e/daemon.ts` spawns the actual compiled `serialwarden daemon` binary
+(default: `target/release/serialwarden`; override with `SERIALWARDEN_BIN` or
+`SERIALWARDEN_PROFILE=debug`) on a throwaway `HOME`/port per test, so it
+never touches a real user's `~/.serialwarden`. This suite is intentionally
 **not** part of `cargo test --all` — it runs in its own `e2e` CI job (see
 `.github/workflows/ci.yml`) so a browser-driven suite never risks that
 budget. `workers: 1` in `e2e/playwright.config.ts` is a deliberate
@@ -95,7 +95,7 @@ attribute Playwright polls, or a real HTTP response) — never a fixed
 ## Default port
 
 The daemon's web GUI listens on `127.0.0.1:5590` by default
-(`serialwrapd::web::DEFAULT_PORT`), overridable via `SERIALWRAP_WEB_PORT`
+(`serialwardend::web::DEFAULT_PORT`), overridable via `SERIALWARDEN_WEB_PORT`
 (mainly so tests can run several daemons at once). The bind address itself
 is never configurable — always `127.0.0.1`; remote access is `ssh -L
 5590:localhost:5590 <host>`, not a network-exposed listener.

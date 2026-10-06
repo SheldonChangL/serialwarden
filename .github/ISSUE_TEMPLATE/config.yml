@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Design docs (wiki)
-    url: https://github.com/SheldonChangL/serialwrap/wiki
+    url: https://github.com/SheldonChangL/serialwarden/wiki
     about: Architecture, record schema, client protocol, and security model.

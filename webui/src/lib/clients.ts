@@ -2,7 +2,7 @@
  * Clients panel data model and API client (`TASKS.md` T5.5, issue #22).
  *
  * `GET /api/clients` merges two sources — see
- * `crates/serialwrapd/src/web/api.rs`'s `list_clients` doc comment:
+ * `crates/serialwardend/src/web/api.rs`'s `list_clients` doc comment:
  *
  * - every *live* client, straight from
  *   `crate::protocol::registry::ClientRegistry::list` (the same table
@@ -19,7 +19,7 @@
 
 export type ClientKind = "human" | "agent" | "tool";
 
-/** Wire spelling of `wrap_proto::Permission` — matches its own
+/** Wire spelling of `warden_proto::Permission` — matches its own
  * `#[serde(rename = ...)]` strings exactly (not `rename_all`, since `+`
  * isn't a valid case-transform target). */
 export type Permission = "read+write" | "read+gated_write" | "lease_only";

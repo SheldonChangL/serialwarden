@@ -164,7 +164,7 @@
 
   /** Flipping a control-line toggle is a live, immediate, individually
    * risky action — deliberately its own request rather than folded into
-   * `applyConfig`'s general "Apply" click (see `crates/serialwrapd/src/web/api.rs`'s
+   * `applyConfig`'s general "Apply" click (see `crates/serialwardend/src/web/api.rs`'s
    * `set_control_lines` doc comment: baud/frame changes must never, as a
    * side effect of one button, also pulse a physical line). */
   async function toggleDtr(): Promise<void> {

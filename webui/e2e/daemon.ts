@@ -1,4 +1,4 @@
-// Spawns/kills the real, compiled `serialwrap daemon` binary for E2E tests
+// Spawns/kills the real, compiled `serialwarden daemon` binary for E2E tests
 // (`TASKS.md` T5.1, issue #18). Deliberately drives the actual production
 // entry point (not an in-process test double) — this suite exists
 // specifically to prove the "open a browser, no separate frontend service"
@@ -14,9 +14,9 @@ import * as net from "node:net";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 function resolveBinary(): string {
-  if (process.env.SERIALWRAP_BIN) return process.env.SERIALWRAP_BIN;
-  const profile = process.env.SERIALWRAP_PROFILE ?? "release";
-  return path.join(REPO_ROOT, "target", profile, "serialwrap");
+  if (process.env.SERIALWARDEN_BIN) return process.env.SERIALWARDEN_BIN;
+  const profile = process.env.SERIALWARDEN_PROFILE ?? "release";
+  return path.join(REPO_ROOT, "target", profile, "serialwarden");
 }
 
 export interface DaemonHandle {
@@ -24,7 +24,7 @@ export interface DaemonHandle {
   url: string;
   /** This instance's throwaway `HOME`/XDG dirs — exposed so `runCli` (T5.4,
    * issue #21's "GUI and CLI decide the same request" test) can spawn the
-   * `serialwrap` CLI against the *same* daemon, pointed at the same UDS
+   * `serialwarden` CLI against the *same* daemon, pointed at the same UDS
    * socket and `rules.toml`, rather than a second, unrelated instance. */
   home: string;
   stop(): Promise<void>;
@@ -81,21 +81,21 @@ async function waitForHealthy(url: string, timeoutMs: number): Promise<void> {
 }
 
 /**
- * Start a real `serialwrap daemon` subprocess bound to `port` (or a fresh
+ * Start a real `serialwarden daemon` subprocess bound to `port` (or a fresh
  * one, auto-allocated, if omitted — pass an explicit port to restart on the
  * *same* address, which the WS-reconnect test needs since the page's
  * `location.host` doesn't change across a daemon restart).
  *
  * Each instance gets its own throwaway `HOME`/XDG dirs so its UDS socket,
  * recorder data dir, and `rules.toml` lookup never collide with a real
- * user's `~/.serialwrap` or with other concurrently-running test daemons.
+ * user's `~/.serialwarden` or with other concurrently-running test daemons.
  */
 export interface StartDaemonOptions {
   port?: number;
   /**
    * Registers a `TestBackend`-backed device named this instead of the
    * real `SystemEnumerator`/hotplug path (`TASKS.md` T5.2, issue #19) —
-   * see `serialwrapd::TEST_BACKEND_DEVICE_ENV`'s doc comment for why this
+   * see `serialwardend::TEST_BACKEND_DEVICE_ENV`'s doc comment for why this
    * exists and why it's safe. Every T5.2 live-log test (`live-log.spec.ts`)
    * needs *some* device with a real recorder behind it to inject records
    * into (`POST /api/devices/:id/test/inject`, see `injectLog` below);
@@ -108,14 +108,14 @@ export interface StartDaemonOptions {
    * dir *before* spawning — lets a test configure e.g. a short
    * `[approval] timeout_s` (T5.4, issue #21's countdown-timeout acceptance
    * criterion needs seconds, not the production 60s default) without
-   * touching `crates/serialwrapd/src/gate/rules.rs`'s own defaults. See
+   * touching `crates/serialwardend/src/gate/rules.rs`'s own defaults. See
    * `rulesTomlPath` for why the destination differs by platform.
    */
   rulesToml?: string;
 }
 
 /**
- * Where `serialwrapd::gate::rules::default_rules_path` resolves to for a
+ * Where `serialwardend::gate::rules::default_rules_path` resolves to for a
  * daemon started with `HOME`/`XDG_CONFIG_HOME` both set to `home` (see
  * `startDaemon`'s env block below) — mirrors the `directories` crate's own
  * platform split that function's doc comment describes: XDG-based on
@@ -127,15 +127,19 @@ export interface StartDaemonOptions {
  */
 function rulesTomlPath(home: string): string {
   if (process.platform === "darwin") {
-    return path.join(home, "Library", "Application Support", "serialwrap", "rules.toml");
+    return path.join(home, "Library", "Application Support", "serialwarden", "rules.toml");
   }
-  return path.join(home, "serialwrap", "rules.toml");
+  return path.join(home, "serialwarden", "rules.toml");
 }
 
 export async function startDaemon(options?: number | StartDaemonOptions): Promise<DaemonHandle> {
   const opts: StartDaemonOptions = typeof options === "number" ? { port: options } : (options ?? {});
   const usePort = opts.port ?? (await allocatePort());
-  const home = mkdtempSync(path.join(tmpdir(), "serialwrap-e2e-"));
+  // Kept short: on macOS the daemon's socket lands at
+  // `<home>/.serialwarden/serialwarden.sock`, and `$TMPDIR` alone is ~50
+  // characters, so a long prefix pushes the path past the 104-byte
+  // `sockaddr_un` limit and the daemon fails to bind.
+  const home = mkdtempSync(path.join(tmpdir(), "sw-e2e-"));
 
   if (opts.rulesToml) {
     const rulesPath = rulesTomlPath(home);
@@ -152,12 +156,12 @@ export async function startDaemon(options?: number | StartDaemonOptions): Promis
     child = spawn(resolveBinary(), ["daemon"], {
       env: {
         ...process.env,
-        SERIALWRAP_WEB_PORT: String(usePort),
+        SERIALWARDEN_WEB_PORT: String(usePort),
         HOME: home,
         XDG_RUNTIME_DIR: home,
         XDG_DATA_HOME: home,
         XDG_CONFIG_HOME: home,
-        ...(opts.testDeviceId ? { SERIALWRAP_TEST_BACKEND_DEVICE: opts.testDeviceId } : {}),
+        ...(opts.testDeviceId ? { SERIALWARDEN_TEST_BACKEND_DEVICE: opts.testDeviceId } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -199,8 +203,8 @@ export async function startDaemon(options?: number | StartDaemonOptions): Promis
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-/** One record `injectLog` can append — mirrors `serialwrapd::web::api`'s
- * `InjectOp` wire shape exactly (`crates/serialwrapd/src/web/api.rs`). */
+/** One record `injectLog` can append — mirrors `serialwardend::web::api`'s
+ * `InjectOp` wire shape exactly (`crates/serialwardend/src/web/api.rs`). */
 export type InjectOp =
   | { kind: "rx"; text?: string; data_b64?: string }
   | { kind: "tx"; text?: string; data_b64?: string; client: string; client_type: "human" | "agent" | "tool"; gate: string }
@@ -211,8 +215,8 @@ export type InjectOp =
  * Append records to a `startDaemon({ testDeviceId })`-registered device's
  * real recorder via `POST /api/devices/:id/test/inject` — the seam every
  * T5.2 live-log E2E test uses to put real data through the real
- * recorder→query→presentation→WS/tail pipeline (`crates/serialwrapd/src/web/api.rs`'s
- * `test_inject` handler; `serialwrapd::TEST_BACKEND_DEVICE_ENV`'s doc
+ * recorder→query→presentation→WS/tail pipeline (`crates/serialwardend/src/web/api.rs`'s
+ * `test_inject` handler; `serialwardend::TEST_BACKEND_DEVICE_ENV`'s doc
  * comment covers why this only ever does anything against a
  * `testDeviceId`-started daemon).
  */
@@ -234,7 +238,7 @@ export interface CliResult {
 }
 
 /**
- * Run the real `serialwrap` CLI binary against `daemon`'s own socket
+ * Run the real `serialwarden` CLI binary against `daemon`'s own socket
  * (T5.4, issue #21's "GUI and CLI decide the same request" acceptance
  * criterion) — same binary `resolveBinary()` picks for the daemon itself,
  * invoked with the identical `HOME`/`XDG_RUNTIME_DIR` env so
@@ -272,18 +276,18 @@ export async function runCli(daemon: DaemonHandle, args: string[]): Promise<CliR
 /**
  * Where a `startDaemon`-spawned instance's UDS socket lives, given the same
  * `HOME`/`XDG_RUNTIME_DIR` env block `startDaemon` sets (T5.5, issue #22) —
- * mirrors `serialwrapd::protocol::server::default_socket_path`'s own
- * platform split (Linux: `$XDG_RUNTIME_DIR/serialwrap.sock`; macOS:
- * `~/.serialwrap/serialwrap.sock`) the same way `rulesTomlPath` above
+ * mirrors `serialwardend::protocol::server::default_socket_path`'s own
+ * platform split (Linux: `$XDG_RUNTIME_DIR/serialwarden.sock`; macOS:
+ * `~/.serialwarden/serialwarden.sock`) the same way `rulesTomlPath` above
  * mirrors `gate::rules::default_rules_path`'s split, so a raw client
  * connects to the exact socket this specific daemon instance is listening
  * on (never a stale or unrelated one).
  */
 function udsSocketPath(daemon: DaemonHandle): string {
   if (process.platform === "darwin") {
-    return path.join(daemon.home, ".serialwrap", "serialwrap.sock");
+    return path.join(daemon.home, ".serialwarden", "serialwarden.sock");
   }
-  return path.join(daemon.home, "serialwrap.sock");
+  return path.join(daemon.home, "serialwarden.sock");
 }
 
 export interface RawClientOptions {
@@ -294,7 +298,7 @@ export interface RawClientOptions {
 
 /**
  * A hand-rolled UDS client speaking the raw newline-delimited-JSON wire
- * protocol directly (`crates/serialwrapd/src/protocol/session.rs`) — used
+ * protocol directly (`crates/serialwardend/src/protocol/session.rs`) — used
  * only where the browser genuinely cannot stand in for a real MCP/CLI
  * client (T5.5, issue #22's kick/S2 acceptance criteria: observing a real
  * connection's own socket close, and a real agent-typed `tail`/`read_since`
@@ -307,7 +311,7 @@ export interface RawClientOptions {
  */
 export interface RawClient {
   /** Send one request object — `id`/`op`/fields flattened onto one JSON
-   * line, matching `wrap_proto::Request`'s own wire shape. */
+   * line, matching `warden_proto::Request`'s own wire shape. */
   send(body: Record<string, unknown>): void;
   /** Resolves with the next full newline-delimited JSON message received
    * (FIFO — a message already buffered before this call resolves

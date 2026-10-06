@@ -141,7 +141,7 @@ test("kicking an agent closes its connection with an observable error, not a sil
  * state — a real, small, race-prone latency window, not something a single
  * fixed-timing `tail` call after the injection can assume has already
  * closed. Bounded polling (not a fixed sleep) for the real event, same
- * discipline `crates/serialwrapd/src/web/api.rs`'s own `wait_until` test
+ * discipline `crates/serialwardend/src/web/api.rs`'s own `wait_until` test
  * helper and this suite's `expect.poll` calls already follow.
  */
 async function pollAgentTailForLine(

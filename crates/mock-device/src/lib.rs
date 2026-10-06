@@ -10,10 +10,10 @@
 //! # Crate boundary
 //!
 //! This is a standalone workspace member, wired in only via
-//! `[dev-dependencies]` (see `crates/serialwrapd/Cargo.toml`) — never a
-//! normal dependency of `serialwrapd` or the `serialwrap` binary. That
+//! `[dev-dependencies]` (see `crates/serialwardend/Cargo.toml`) — never a
+//! normal dependency of `serialwardend` or the `serialwarden` binary. That
 //! guarantees the PTY/libc plumbing here never links into the release
-//! binary, and lets any workspace crate's tests (not just `serialwrapd`'s)
+//! binary, and lets any workspace crate's tests (not just `serialwardend`'s)
 //! depend on it later without reaching into another crate's private
 //! `#[cfg(test)]` internals.
 //!

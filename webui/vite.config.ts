@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 // The default port the daemon's own axum server listens on
-// (`serialwrapd::web::DEFAULT_PORT`) — kept in sync manually since this
+// (`serialwardend::web::DEFAULT_PORT`) — kept in sync manually since this
 // config has no access to Rust source. `npm run dev` proxies `/api` there
 // so the Vite dev server can be used for frontend iteration without a
 // release build; production serving is entirely the daemon's job (see

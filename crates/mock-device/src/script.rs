@@ -31,12 +31,12 @@ pub fn repeated_line(line: &str, times: usize) -> Vec<u8> {
 
 /// Line-ending convention for [`lines_with_ending`]/
 /// [`repeated_line_with_ending`] — the generator-side counterpart of the
-/// read-side line-assembly conventions `serialwrapd::query`'s
+/// read-side line-assembly conventions `serialwardend::query`'s
 /// `LineTerminatorMode`/auto-detection now handles (issue #52), and of the
-/// write-side conventions `serialwrap write -e lf|crlf|cr` already exposed.
+/// write-side conventions `serialwarden write -e lf|crlf|cr` already exposed.
 /// Before issue #52, every mock-device fixture in this crate was hardcoded
 /// to `Lf`, which is exactly why none of this project's tests exercised
-/// CR-only assembly until this issue's own fixtures (in `serialwrapd::query`
+/// CR-only assembly until this issue's own fixtures (in `serialwardend::query`
 /// and this module's own tests below) added it directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineEnding {
@@ -74,7 +74,7 @@ pub fn lines_with_ending(lines: &[&str], ending: LineEnding) -> Vec<u8> {
 }
 
 /// [`repeated_line`], generalized to any [`LineEnding`] — for exercising
-/// `serialwrapd::query`'s CR-only/CRLF/LF line assembly and auto-detection
+/// `serialwardend::query`'s CR-only/CRLF/LF line assembly and auto-detection
 /// (issue #52) with mock-device fixtures instead of hand-built byte
 /// literals in every test.
 pub fn repeated_line_with_ending(line: &str, times: usize, ending: LineEnding) -> Vec<u8> {

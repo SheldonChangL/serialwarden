@@ -1,9 +1,9 @@
-# serialwrap write-gate policy (`TASKS.md` T4.1, issue #14).
+# serialwarden write-gate policy (`TASKS.md` T4.1, issue #14).
 #
 # Copy this file to the daemon's config directory to customize it:
-#   Linux:  ~/.config/serialwrap/rules.toml   ($XDG_CONFIG_HOME/serialwrap/rules.toml)
-#   macOS:  ~/Library/Application Support/serialwrap/rules.toml
-# (see `serialwrapd::gate::rules::default_rules_path` — the same
+#   Linux:  ~/.config/serialwarden/rules.toml   ($XDG_CONFIG_HOME/serialwarden/rules.toml)
+#   macOS:  ~/Library/Application Support/serialwarden/rules.toml
+# (see `serialwardend::gate::rules::default_rules_path` — the same
 # `directories::ProjectDirs` crate `recorder::default_data_dir` already
 # uses, just `config_dir()` instead of `data_dir()`: this file is
 # hand-authored operator policy, not recorded device data, so it lives

@@ -3,7 +3,7 @@
  *
  * `GET /api/devices/:id/audit` is a pure filtered read over the same event
  * stream `tail`/`export` read from (see
- * `crates/serialwrapd/src/web/api.rs`'s `audit` doc comment) — every row
+ * `crates/serialwardend/src/web/api.rs`'s `audit` doc comment) — every row
  * here is one real record, shaped by the same `presentation::event_to_json`
  * function `tail`'s own `events` field already uses. Nothing is joined or
  * correlated across rows: a denied write's bytes live on their own
@@ -119,7 +119,7 @@ export function extraFields(row: AuditRow): [string, unknown][] {
 
 /** Client-side text filter over a row — a plain case-insensitive substring
  * match against every field's stringified value, mirroring
- * `crates/serialwrap/src/cli/audit.rs`'s own `--actor` convention (a
+ * `crates/serialwarden/src/cli/audit.rs`'s own `--actor` convention (a
  * substring match against the record's raw JSON) rather than a structured
  * per-field lookup: the same identity can appear as `client`,
  * `requester_name`, or inside a `reason` string. Applied client-side, same

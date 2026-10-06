@@ -1,5 +1,5 @@
 // E2E for the timeline and port settings popover (`TASKS.md` T5.3, issue
-// #20). Drives the real compiled `serialwrap daemon` binary
+// #20). Drives the real compiled `serialwarden daemon` binary
 // (`startDaemon({ testDeviceId })`) and the real built frontend, injecting
 // records through `POST /api/devices/:id/test/inject` and driving config
 // changes through the real `POST /api/devices/:id/config` endpoint — no
@@ -140,7 +140,7 @@ test("a mostly-undecodable rx burst surfaces a baud suggestion in the settings p
   // 300 bytes stepping through the 0x80-0xFF range is overwhelmingly
   // invalid UTF-8 (continuation/lead bytes with no valid sequence around
   // them) — the same fixture shape
-  // `crates/serialwrapd/src/web/api.rs`'s own
+  // `crates/serialwardend/src/web/api.rs`'s own
   // `compute_decode_health_suggests_a_different_baud_for_a_mostly_garbled_sample`
   // unit test uses, here driven through the real HTTP/WS pipeline instead.
   const garbled = Buffer.concat([

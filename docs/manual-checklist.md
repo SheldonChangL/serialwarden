@@ -19,7 +19,7 @@
 
 ## 1. 自訂 Baud Rate（74880）
 
-對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/issues/5)（`needs:hardware`）
+對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwarden/issues/5)（`needs:hardware`）
 
 74880 是 ESP8266 開機 log 的預設 baud，是最常見、也最容易在跨平台 API 上出錯的
 非標準值（`serialport` crate 在 macOS 走 `IOSSIOSPEED`、Linux 走
@@ -37,7 +37,7 @@
 
 ## 2. 「不觸碰 DTR/RTS」開啟不觸發 Arduino Uno 自動 reset
 
-對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/issues/5)（`needs:hardware`）
+對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwarden/issues/5)（`needs:hardware`）
 
 Arduino Uno（及多數用 DTR 觸發 reset 進 bootloader 的板子）在 serial port 被
 `open()` 時，若 DTR 被驅動預設拉低再拉高，會觸發 MCU reset。「不觸碰
@@ -57,24 +57,24 @@ DTR/RTS」模式必須讓 daemon 開啟 port 時完全不改變這兩條控制�
   - 判定通過：呼叫 `dtr_pulse` 後板子重新開機（boot banner 重新出現）；若特定板子的極性相反，記錄下來供之後調整預設方向
   - 驗證紀錄：
 
-## 3. `serialwrap run -- esptool` 實機燒錄
+## 3. `serialwarden run -- esptool` 實機燒錄
 
-對應：T2.2 Lease 模式 `serialwrap run --` — [issue #9](https://github.com/SheldonChangL/serialwrap/issues/9)（`needs:hardware`）
+對應：T2.2 Lease 模式 `serialwarden run --` — [issue #9](https://github.com/SheldonChangL/serialwarden/issues/9)（`needs:hardware`）
 
 Lease 機制（daemon 讓出 port fd 給子行程獨佔）只有跑一次真正的燒錄流程才能
 證明「daemon 收回 port、恢復錄製、期間其他 client 沒有斷線」全部成立；mock
-device 治具（`crates/serialwrapd/tests/lease.rs`、`lease_protocol.rs`、
-`crates/serialwrap/tests/run_cli.rs`）已經涵蓋狀態機（fd 讓出/收回的時序、
+device 治具（`crates/serialwardend/tests/lease.rs`、`lease_protocol.rs`、
+`crates/serialwarden/tests/run_cli.rs`）已經涵蓋狀態機（fd 讓出/收回的時序、
 含共享 fd 斷言）、事件欄位與起訖時間、follow 不斷線、子行程 SIGKILL、
 `--lease-timeout`、daemon 重啟後殘留 lease 收回——這些都不必重複用實機驗證。
 這裡剩下、也只有實機才測得出來的，是 esptool 這種真實工具對 port 的實際
 操作模式（開啟方式、DTR/RTS timing、baud 切換順序等）是否被正確相容。
 
-- [ ] macOS：`serialwrap run -- esptool.py write_flash ...` 完整燒錄一次成功
+- [ ] macOS：`serialwarden run -- esptool.py write_flash ...` 完整燒錄一次成功
   - 所需硬體：ESP8266/ESP32 開發板
-  - 前置注意：`serialwrap run` 不會自動幫 esptool 補上 `--port`；它會把 daemon
-    交出的裝置路徑存進子行程的 `SERIALWRAP_LEASE_PATH` 環境變數，實測時自己組
-    指令，例如 `serialwrap run -- esptool.py --port "$SERIALWRAP_LEASE_PATH" write_flash 0x0 firmware.bin`
+  - 前置注意：`serialwarden run` 不會自動幫 esptool 補上 `--port`；它會把 daemon
+    交出的裝置路徑存進子行程的 `SERIALWARDEN_LEASE_PATH` 環境變數，實測時自己組
+    指令，例如 `serialwarden run -- esptool.py --port "$SERIALWARDEN_LEASE_PATH" write_flash 0x0 firmware.bin`
     （或直接手動填已知的 `/dev/cu.*`／`/dev/ttyUSB*` 路徑）。
   - 判定通過：燒錄完成、esptool 回報成功；燒錄後裝置 boot log 被完整錄到（對應 S3 出口情境）；燒錄期間另一個 client 的 `tail -f` 收到 lease 事件而非斷線
   - 驗證紀錄：
@@ -85,7 +85,7 @@ device 治具（`crates/serialwrapd/tests/lease.rs`、`lease_protocol.rs`、
 
 ## 4. 桌面通知
 
-對應：T4.2 審批流程與通知 — [issue #15](https://github.com/SheldonChangL/serialwrap/issues/15)（`needs:hardware`，嚴格說是「需要桌面環境」而非硬體，但同樣無法在無頭 CI 上驗）
+對應：T4.2 審批流程與通知 — [issue #15](https://github.com/SheldonChangL/serialwarden/issues/15)（`needs:hardware`，嚴格說是「需要桌面環境」而非硬體，但同樣無法在無頭 CI 上驗）
 
 - [ ] macOS：審批請求觸發 `osascript`（或 terminal-notifier）桌面通知，實際看到彈出
   - 所需硬體/環境：有登入 GUI session 的 macOS 桌面
@@ -101,7 +101,7 @@ device 治具（`crates/serialwrapd/tests/lease.rs`、`lease_protocol.rs`、
 
 ## 5. Linux `TIOCGICOUNT` 錯誤計數；macOS 顯示 unavailable
 
-對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/issues/5)（`needs:hardware`）
+對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwarden/issues/5)（`needs:hardware`）
 
 Linux 的 framing/overrun/parity error 計數走 `TIOCGICOUNT` ioctl；macOS 沒有對應
 機制。這裡要驗證兩件事：Linux 上計數真的隨錯誤增加、macOS 上介面誠實回報
@@ -118,7 +118,7 @@ Linux 的 framing/overrun/parity error 計數走 `TIOCGICOUNT` ioctl；macOS 沒
 
 ## 6. 打包安裝與服務自啟（乾淨 VM、launchd、systemd）
 
-對應：T6.1 打包與服務安裝 — [issue #23](https://github.com/SheldonChangL/serialwrap/issues/23)（`needs:hardware`）
+對應：T6.1 打包與服務安裝 — [issue #23](https://github.com/SheldonChangL/serialwarden/issues/23)（`needs:hardware`）
 
 這裡的 mock-device 治具原理上就測不出「一台從沒裝過開發環境的機器，從零開始能不能在
 15 分鐘內裝起來看到 log」——這個問題的答案恰恰取決於治具刻意繞過的東西：相依套件是否
@@ -140,18 +140,18 @@ session 已經自動驗過的部分」與「仍需要人在真實環境跑一次
     只驗了背後的 HTTP API 有回應）、也沒有真實開機/reboot 流程可測。它驗證的
     是「相依套件是否齊全、install script 能不能跑、文件步驟有沒有缺漏」，這正
     是 Docker 測法的價值所在，但不能取代下面兩項乾淨 VM 待驗項目。
-- [x] `serialwrap service install --dry-run` 產出的 launchd plist（macOS，本機
+- [x] `serialwarden service install --dry-run` 產出的 launchd plist（macOS，本機
   原生跑，非容器）：`plutil -lint` 驗證合法 XML；內容含正確的
   `ProgramArguments`（binary 絕對路徑 + `daemon`）、`RunAtLoad`/`KeepAlive`。
-- [x] `serialwrap service install --dry-run` 產出的 systemd user unit（Linux，
+- [x] `serialwarden service install --dry-run` 產出的 systemd user unit（Linux，
   Docker）：內容含正確的 `ExecStart`（binary 絕對路徑 + `daemon`）、
   `WantedBy=default.target`；`service install`（非 dry-run，假 `$HOME`）確認
   檔案真的被寫入，且在容器內沒有真正 systemd session 時，`systemctl --user
   daemon-reload` 失敗會回傳明確錯誤而不是靜默假裝成功。
-- [x] `cargo deb -p serialwrap` 產出的 `.deb`（Docker，`x86_64` 目標，與
+- [x] `cargo deb -p serialwarden` 產出的 `.deb`（Docker，`x86_64` 目標，與
   release workflow 同架構）：`dpkg-deb -c`/`-I` 確認檔案佈局正確
-  （`usr/bin/serialwrap`、`lib/udev/rules.d/60-serialwrap.rules`、
-  `usr/share/doc/serialwrap/README.md`）與 control metadata 正確（package
+  （`usr/bin/serialwarden`、`lib/udev/rules.d/60-serialwarden.rules`、
+  `usr/share/doc/serialwarden/README.md`）與 control metadata 正確（package
   name、maintainer、`Depends: libc6 (>= 2.39)` 自動偵測）。
 
 **仍待人工在真實環境驗證：**
@@ -167,15 +167,15 @@ session 已經自動驗過的部分」與「仍需要人在真實環境跑一次
   - 判定通過：照 README 從安裝到瀏覽器看到 GUI log ≤15 分鐘（實測計時＋畫面截圖），且用真實 USB-serial 裝置而非本 session 用的內部測試後門
 - [ ] 重開機後 daemon 自動啟動並恢復錄製 — macOS（launchd）
   - 所需硬體/環境：乾淨 macOS 機器或 VM，登入 GUI session
-  - 判定通過：`serialwrap service install` 後重開機，不需手動操作，`serialwrap devices`/GUI 顯示 daemon 已在跑且先前錄製的資料還在
+  - 判定通過：`serialwarden service install` 後重開機，不需手動操作，`serialwarden devices`/GUI 顯示 daemon 已在跑且先前錄製的資料還在
 - [ ] 重開機後 daemon 自動啟動並恢復錄製 — Linux（systemd --user）
   - 所需硬體/環境：乾淨 Ubuntu 機器或 VM；須先跑過 `loginctl enable-linger
     "$USER"`（README 已提示這一步，沒有它 user unit 只在有登入 session 時才會
     啟動，不會在開機當下就跑）
   - 判定通過：重開機（不登入任何 session）後 `systemctl --user status
-    com.serialwrap.daemon.service` 顯示 running，且先前錄製的資料還在
+    com.serialwarden.daemon.service` 顯示 running，且先前錄製的資料還在
 - [ ] macOS 常見驅動（CH340/CP210x）指引本身是否對得上真實核可流程
-  - 判定通過：照 README「macOS: 常見 USB-serial 驅動」段落安裝後，`serialwrap devices` 真的看得到裝置；記下實際核可對話框的位置是否與文件描述相符（Apple 各版本措辭常變動）
+  - 判定通過：照 README「macOS: 常見 USB-serial 驅動」段落安裝後，`serialwarden devices` 真的看得到裝置；記下實際核可對話框的位置是否與文件描述相符（Apple 各版本措辭常變動）
 
 ---
 
@@ -183,11 +183,11 @@ session 已經自動驗過的部分」與「仍需要人在真實環境跑一次
 
 以下項目在對應任務開工時應併入該任務自己的驗收流程，這裡先登記避免遺漏。
 
-### T1.1 裝置識別與熱插拔 — [issue #3](https://github.com/SheldonChangL/serialwrap/issues/3)
+### T1.1 裝置識別與熱插拔 — [issue #3](https://github.com/SheldonChangL/serialwarden/issues/3)
 
 - [ ] macOS 實機驗證一律使用 `/dev/cu.*` 節點且開啟不阻塞（不是 `/dev/tty.*`）
   - 所需硬體：任意 USB-serial 轉接器
-  - 判定通過：`serialwrapd` 開啟裝置時使用的路徑經確認是 `cu.*`；反覆插拔不出現因等待 DCD 而卡住的開啟
+  - 判定通過：`serialwardend` 開啟裝置時使用的路徑經確認是 `cu.*`；反覆插拔不出現因等待 DCD 而卡住的開啟
 
 ---
 

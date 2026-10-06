@@ -236,10 +236,10 @@
   {:else}
     <div class="stage">
       <div class="startup">
-        <h1>serialwrap</h1>
+        <h1>serialwarden</h1>
         {#if devicesError}
           <p>Can't reach the daemon — {devicesError}</p>
-          <p class="hint">Start it with <code>serialwrap daemon</code>, then reload.</p>
+          <p class="hint">Start it with <code>serialwarden daemon</code>, then reload.</p>
         {:else}
           <p>No serial ports yet.</p>
           <p class="hint">

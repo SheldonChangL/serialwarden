@@ -40,7 +40,7 @@ export interface LeaseBand {
 }
 
 /** A `control_line_change`/`dtr_pulse` event counts as a "reset" marker —
- * both are exactly the operations `crates/serialwrapd/src/device_profile.rs`
+ * both are exactly the operations `crates/serialwardend/src/device_profile.rs`
  * documents as physically resetting most boards when they touch DTR (see
  * that module's "Event naming" section, and the Security-model wiki's
  * config-changes policy table: "Toggle DTR/RTS, dtr_pulse: gated ... Gated
@@ -96,7 +96,7 @@ export function buildTimelineMarkers(items: LogItem[]): TimelineMarker[] {
 }
 
 /** Pair up `lease_start`/`lease_end` events (matched by their shared
- * `token` — see `crates/serialwrapd/src/port.rs`'s `append_lease_start_event`/
+ * `token` — see `crates/serialwardend/src/port.rs`'s `append_lease_start_event`/
  * `append_lease_end_event`) into bands the timeline paints as a coloured
  * range, mirroring the UX-design wiki's main-log-view mockup ("▌ 10:32:01 –
  * 10:32:47 esptool held the port (flashing)"). A `lease_start` with no
@@ -155,7 +155,7 @@ export function timelineDomain(items: LogItem[]): [number, number] | null {
 
 /** A drag-selected [start, end] range on the timeline, resolved back to the
  * nearest real items in `items` — this is the interface T5.5's export UI is
- * expected to consume (`crates/wrap-proto/src/request.rs`'s `ExportBound`
+ * expected to consume (`crates/warden-proto/src/request.rs`'s `ExportBound`
  * is `Seq(u64) | Wall(String)`; this carries both forms of each edge so
  * T5.5 can pick whichever `export_range` wants without this module needing
  * to know export's own wire shape). */

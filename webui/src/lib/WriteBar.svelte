@@ -3,7 +3,7 @@
    * The operator's half of the conversation.
    *
    * Until this existed the GUI could only listen: the CLI had
-   * `serialwrap write` and an agent had the MCP `write` tool, but the one
+   * `serialwarden write` and an agent had the MCP `write` tool, but the one
    * surface a person actually sits in front of couldn't send a byte, which
    * made "share the port" true for every client except the human. This is
    * the missing half.
