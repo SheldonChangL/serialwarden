@@ -1,12 +1,12 @@
 /**
  * Approval card data model and API client (`TASKS.md` T5.4, issue #21).
  *
- * Reuses the exact same daemon-side API `serialwrap approvals` already
+ * Reuses the exact same daemon-side API `serialwarden approvals` already
  * decides through: `GET /api/approvals` / `POST /api/approvals/:id/approve`
  * / `POST /api/approvals/:id/deny` call straight into
- * `crates/serialwrapd/src/protocol/Shared::gate` (see that module's own doc
+ * `crates/serialwardend/src/protocol/Shared::gate` (see that module's own doc
  * comment), the same single `Gate`/`PendingQueue` instance a concurrent
- * `serialwrap approvals approve/deny` decides through over UDS — there is
+ * `serialwarden approvals approve/deny` decides through over UDS — there is
  * no second write-gate implementation for the GUI.
  */
 
@@ -74,7 +74,7 @@ export function denyApproval(id: number, reason?: string): Promise<DecideOutcome
  * refresh the approvals list sooner than the host component's own coarse
  * poll interval — a new pending write (or someone else's decision) already
  * flows through the device's ordinary `event`/`gate` record stream (see
- * `crates/serialwrapd/src/gate.rs`'s `submit_write`: it appends a `gate`
+ * `crates/serialwardend/src/gate.rs`'s `submit_write`: it appends a `gate`
  * `request` record and a `write_request` event on the *same* per-device
  * stream `WS /api/stream?device=...` already pushes), so this doesn't need
  * to parse or care which message arrived — any `push` is worth a refetch.

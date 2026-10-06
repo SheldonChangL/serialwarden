@@ -1,6 +1,6 @@
 [package]
 name = "mock-device"
-description = "PTY-backed mock serial device for tests. Test-only fixture: never a dependency of the serialwrap release binary."
+description = "PTY-backed mock serial device for tests. Test-only fixture: never a dependency of the serialwarden release binary."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

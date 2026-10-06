@@ -3,7 +3,7 @@
  * fetches the initial `tail` page, then opens `WS /api/stream?device=...`
  * with `since_cursor` set to that page's cursor — closing the
  * tail-then-subscribe gap exactly the way the Client-protocol wiki
- * documents (`crates/serialwrapd/src/web/stream.rs`'s module doc comment
+ * documents (`crates/serialwardend/src/web/stream.rs`'s module doc comment
  * has the daemon side of this contract).
  *
  * Deliberately a separate socket from `connection.ts`'s app-level
@@ -33,7 +33,7 @@ async function fetchTail(deviceId: string, n?: number): Promise<PresentedPageJso
 }
 
 /** `decode_health`'s wire shape (`TASKS.md` T5.3, issue #20 —
- * `crates/serialwrapd/src/web/api.rs`'s `DecodeHealth`): whether recent
+ * `crates/serialwardend/src/web/api.rs`'s `DecodeHealth`): whether recent
  * output looks like it's arriving at the wrong baud, and what to try
  * instead. `suggested_baud` is only ever present once both a minimum sample
  * size and an undecodable-ratio threshold are met — see that struct's doc
@@ -63,7 +63,7 @@ export async function fetchDeviceConfig(deviceId: string): Promise<DeviceConfig>
  * one-click "還原" (revert) button — both send a partial
  * `PortConfig` patch (only the fields that actually changed; revert sends
  * back the event's whole `old` value) and get the merged, full config back.
- * Ungated — see `crates/serialwrapd/src/web/api.rs`'s `GUI_CHANGED_BY` doc
+ * Ungated — see `crates/serialwardend/src/web/api.rs`'s `GUI_CHANGED_BY` doc
  * comment for why the web GUI's own config/control-line writes never go
  * through the write gate. */
 export async function setDeviceConfig(
@@ -105,7 +105,7 @@ export async function setControlLines(
   }
 }
 
-/** What to append after `text`. Mirrors `wrap_proto::LineEnding`'s wire
+/** What to append after `text`. Mirrors `warden_proto::LineEnding`'s wire
  * names — sending the wrong one to a firmware CLI is the classic reason a
  * board "ignores" a command, which is why this is a visible control in the
  * write bar rather than a hidden constant. */
@@ -117,7 +117,7 @@ export interface WritePayload {
   /** Exact bytes, base64. Sent verbatim, no line ending — hex mode parses
    * the operator's digits in the browser and encodes them here, so the
    * daemon keeps exactly one byte-decoding path (see the `WriteBody` doc
-   * comment in `crates/serialwrapd/src/web/api.rs`). */
+   * comment in `crates/serialwardend/src/web/api.rs`). */
   data_b64?: string;
   line_ending?: LineEnding;
 }
@@ -126,10 +126,10 @@ export interface WritePayload {
  *
  * Goes out immediately rather than through the write gate, because the
  * person clicking Send is the human the gate exists to ask — the same
- * `human` bypass `serialwrap write` has always had over UDS. It is still
+ * `human` bypass `serialwarden write` has always had over UDS. It is still
  * audited: the daemon appends the same `tx` record every other write path
  * produces, so this write appears in this very log view, in every other
- * client's `tail`, and in `serialwrap audit`. */
+ * client's `tail`, and in `serialwarden audit`. */
 export async function writeToDevice(
   deviceId: string,
   payload: WritePayload,

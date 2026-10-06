@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
-# serialwrap install script — macOS and Linux.
+# serialwarden install script — macOS and Linux.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/SheldonChangL/serialwrap/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/SheldonChangL/serialwarden/main/install.sh | sh
 #
 # What it does, in order:
 #   1. Pick the prebuilt release asset for this machine:
@@ -21,30 +21,30 @@
 #      and the optional udev rule — since both need sudo, and a piped install
 #      script must not escalate privileges on its own.
 #
-# Everything installs under $SERIALWRAP_PREFIX (default: $HOME/.local); no
+# Everything installs under $SERIALWARDEN_PREFIX (default: $HOME/.local); no
 # sudo is needed for the binary itself.
 #
 # Environment overrides:
-#   SERIALWRAP_PREFIX         install prefix (default: $HOME/.local)
-#   SERIALWRAP_VERSION        release tag to install, e.g. v0.1.0 (default: latest)
-#   SERIALWRAP_DOWNLOAD_BASE  base URL holding <tag>/<asset> (default: this
+#   SERIALWARDEN_PREFIX         install prefix (default: $HOME/.local)
+#   SERIALWARDEN_VERSION        release tag to install, e.g. v0.1.0 (default: latest)
+#   SERIALWARDEN_DOWNLOAD_BASE  base URL holding <tag>/<asset> (default: this
 #                             repo's GitHub release downloads; useful for a
 #                             mirror, or for testing this script locally)
-#   SERIALWRAP_FROM_SOURCE=1  skip the prebuilt download and build from source
+#   SERIALWARDEN_FROM_SOURCE=1  skip the prebuilt download and build from source
 #
-# Release assets are named `serialwrap-<tag>-<target-triple>.tar.gz` by
+# Release assets are named `serialwarden-<tag>-<target-triple>.tar.gz` by
 # `.github/workflows/release.yml` — if that naming changes, update both
 # places together.
 set -eu
 
-REPO="SheldonChangL/serialwrap"
-PREFIX="${SERIALWRAP_PREFIX:-$HOME/.local}"
+REPO="SheldonChangL/serialwarden"
+PREFIX="${SERIALWARDEN_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
-SHARE_DIR="$PREFIX/share/serialwrap"
-VERSION="${SERIALWRAP_VERSION:-latest}"
-DOWNLOAD_BASE="${SERIALWRAP_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download}"
+SHARE_DIR="$PREFIX/share/serialwarden"
+VERSION="${SERIALWARDEN_VERSION:-latest}"
+DOWNLOAD_BASE="${SERIALWARDEN_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download}"
 
-log() { printf 'serialwrap-install: %s\n' "$*" >&2; }
+log() { printf 'serialwarden-install: %s\n' "$*" >&2; }
 die() {
     log "$*"
     exit 1
@@ -67,7 +67,7 @@ Linux)
     esac
     ;;
 *)
-    die "unsupported OS '$OS' — serialwrap supports macOS and Linux"
+    die "unsupported OS '$OS' — serialwarden supports macOS and Linux"
     ;;
 esac
 
@@ -113,7 +113,7 @@ try_prebuilt_release() {
         log "no published GitHub release found (or GitHub unreachable)"
         return 1
     }
-    asset="serialwrap-${tag}-${TARGET_TRIPLE}.tar.gz"
+    asset="serialwarden-${tag}-${TARGET_TRIPLE}.tar.gz"
     tmp=$(mktemp -d)
     log "downloading ${asset} (${tag})"
     if ! curl -fsSL "$DOWNLOAD_BASE/$tag/$asset" -o "$tmp/$asset"; then
@@ -135,14 +135,14 @@ try_prebuilt_release() {
     # This function runs as an `if` condition, where `set -e` is suspended,
     # so every step past the checksum check fails loudly on its own.
     tar -xzf "$tmp/$asset" -C "$tmp" || die "failed to extract $asset"
-    dir="$tmp/serialwrap-${tag}-${TARGET_TRIPLE}"
-    install -m 0755 "$dir/serialwrap" "$BIN_DIR/serialwrap" || die "failed to install to $BIN_DIR/serialwrap"
-    if [ -f "$dir/60-serialwrap.rules" ]; then
+    dir="$tmp/serialwarden-${tag}-${TARGET_TRIPLE}"
+    install -m 0755 "$dir/serialwarden" "$BIN_DIR/serialwarden" || die "failed to install to $BIN_DIR/serialwarden"
+    if [ -f "$dir/60-serialwarden.rules" ]; then
         mkdir -p "$SHARE_DIR" || die "failed to create $SHARE_DIR"
-        install -m 0644 "$dir/60-serialwrap.rules" "$SHARE_DIR/60-serialwrap.rules" || die "failed to install the udev rule template"
+        install -m 0644 "$dir/60-serialwarden.rules" "$SHARE_DIR/60-serialwarden.rules" || die "failed to install the udev rule template"
     fi
     rm -rf "$tmp"
-    log "installed serialwrap $tag to $BIN_DIR/serialwrap"
+    log "installed serialwarden $tag to $BIN_DIR/serialwarden"
     return 0
 }
 
@@ -152,26 +152,26 @@ build_from_source() {
     done
     src=$(mktemp -d)
     log "building from source in $src (the slow path: expect a few minutes for the first cargo build)"
-    git clone --depth 1 "https://github.com/$REPO.git" "$src/serialwrap"
+    git clone --depth 1 "https://github.com/$REPO.git" "$src/serialwarden"
     (
-        cd "$src/serialwrap/webui"
+        cd "$src/serialwarden/webui"
         npm ci
         npm run build
     )
     (
-        cd "$src/serialwrap"
-        cargo build --release -p serialwrap
+        cd "$src/serialwarden"
+        cargo build --release -p serialwarden
     )
-    install -m 0755 "$src/serialwrap/target/release/serialwrap" "$BIN_DIR/serialwrap"
+    install -m 0755 "$src/serialwarden/target/release/serialwarden" "$BIN_DIR/serialwarden"
     if [ "$OS" = "Linux" ]; then
         mkdir -p "$SHARE_DIR"
-        install -m 0644 "$src/serialwrap/packaging/linux/60-serialwrap.rules" "$SHARE_DIR/60-serialwrap.rules"
+        install -m 0644 "$src/serialwarden/packaging/linux/60-serialwarden.rules" "$SHARE_DIR/60-serialwarden.rules"
     fi
     rm -rf "$src"
-    log "built and installed to $BIN_DIR/serialwrap"
+    log "built and installed to $BIN_DIR/serialwarden"
 }
 
-if [ "${SERIALWRAP_FROM_SOURCE:-0}" = "1" ] || ! try_prebuilt_release; then
+if [ "${SERIALWARDEN_FROM_SOURCE:-0}" = "1" ] || ! try_prebuilt_release; then
     build_from_source
 fi
 
@@ -182,16 +182,16 @@ esac
 
 if [ "$OS" = "Linux" ]; then
     cat >&2 <<EOF
-serialwrap-install: binary installed. Two permission steps this script does
+serialwarden-install: binary installed. Two permission steps this script does
 NOT run for you (both need sudo, and a piped install script should not
 silently escalate privileges):
 
   1. Add yourself to the 'dialout' group, then log out and back in:
        sudo usermod -aG dialout "\$USER"
 
-  2. (optional, only if 'serialwrap devices' can't see your adapter after
+  2. (optional, only if 'serialwarden devices' can't see your adapter after
      step 1) install the udev rule template:
-       sudo cp $SHARE_DIR/60-serialwrap.rules /etc/udev/rules.d/
+       sudo cp $SHARE_DIR/60-serialwarden.rules /etc/udev/rules.d/
        sudo udevadm control --reload-rules && sudo udevadm trigger
 
 EOF
@@ -199,7 +199,7 @@ fi
 
 cat >&2 <<EOF
 Next:
-  serialwrap daemon            # run in the foreground to watch it start, or
-  serialwrap service install   # start it at login (launchd / systemd --user)
+  serialwarden daemon            # run in the foreground to watch it start, or
+  serialwarden service install   # start it at login (launchd / systemd --user)
 Then open http://127.0.0.1:5590 for the web UI (served by the daemon itself).
 EOF

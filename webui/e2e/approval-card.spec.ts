@@ -1,11 +1,11 @@
 // E2E for the approval card (`TASKS.md` T5.4, issue #21). Drives the real
-// compiled `serialwrap daemon` binary plus, for the "GUI and CLI don't
-// double-decide" test, the real `serialwrap` CLI as a second client of the
+// compiled `serialwarden daemon` binary plus, for the "GUI and CLI don't
+// double-decide" test, the real `serialwarden` CLI as a second client of the
 // same daemon (`runCli`) — and the real built frontend throughout.
 //
 // A real MCP/UDS "agent" client is impractical to open from a browser test,
 // so "an agent triggers a pending write" is simulated via
-// `POST /api/devices/:id/test/submit_write` (`crates/serialwrapd/src/web/api.rs`'s
+// `POST /api/devices/:id/test/submit_write` (`crates/serialwardend/src/web/api.rs`'s
 // `test_submit_write`, gated the same way `test/inject` is) — this still
 // drives the real `Gate::submit_write` → `PendingQueue` → WS-push →
 // `GET /api/approvals` → decide pipeline end to end; only the "an agent
@@ -131,8 +131,8 @@ test("the GUI and a concurrent CLI decision on the same request never both succe
   // construction and would make this test flaky without proving anything
   // more about the underlying atomicity — that atomicity is already
   // covered directly, at both the `PendingQueue::decide` and HTTP-handler
-  // levels, by `crates/serialwrapd/src/gate/approval.rs`'s and
-  // `crates/serialwrapd/src/web/api.rs`'s own Rust test suites). What this
+  // levels, by `crates/serialwardend/src/gate/approval.rs`'s and
+  // `crates/serialwardend/src/web/api.rs`'s own Rust test suites). What this
   // E2E test proves is what those can't: that a GUI decision attempt on a
   // request the CLI *just* resolved gets a clean, structured rejection —
   // never a silent second success — and that the GUI eventually reflects
@@ -146,7 +146,7 @@ test("the GUI and a concurrent CLI decision on the same request never both succe
   expect(approveRes.status()).toBe(409);
 
   // `GET /tail` reads through `DeviceQueryState`'s own cached, background-
-  // polled view of the recorder (`crates/serialwrapd/src/query.rs`'s
+  // polled view of the recorder (`crates/serialwardend/src/query.rs`'s
   // `spawn_poller`, a 5ms tick this task's scope doesn't touch) rather than
   // the recorder directly — a CLI decision made over a wholly separate UDS
   // connection has no reason to be visible there *synchronously*, only

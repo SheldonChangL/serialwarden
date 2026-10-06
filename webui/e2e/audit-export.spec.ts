@@ -63,7 +63,7 @@ test("audit panel's jump-to-log lands on the exact record it names", async ({ pa
 // ---- T5.5 acceptance criterion 2: GUI export byte-identical to CLI export ----
 
 async function cliExportToFile(daemon: DaemonHandle, args: string[]): Promise<Buffer> {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "serialwrap-export-e2e-"));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "serialwarden-export-e2e-"));
   const outFile = path.join(tmp, "out.bin");
   try {
     const result = await runCli(daemon, [...args, "-o", outFile]);

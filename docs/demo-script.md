@@ -6,7 +6,7 @@ A 20–30 second recording for the top of the README and for launch posts. It mu
 
 - A board that prints a recognizable boot banner and can be flashed over the same USB-serial port (an ESP32 dev board with `esptool.py` is the most familiar choice for viewers).
 - Terminal at about 100×30, a large font, and a clean prompt. Browser at about 1280×720.
-- The daemon already running (`serialwrap service install`, or `serialwrap daemon` in a hidden tab), and the board already plugged in so its log is flowing.
+- The daemon already running (`serialwarden service install`, or `serialwarden daemon` in a hidden tab), and the board already plugged in so its log is flowing.
 - Pre-build the firmware so the flash itself is short. Set `--lease-timeout` generously.
 
 Layout: browser (web UI) on the left half, two terminal panes on the right: top for the agent, bottom for the flasher.
@@ -15,9 +15,9 @@ Layout: browser (web UI) on the left half, two terminal panes on the right: top 
 
 | t (s) | Screen | What it shows |
 |---|---|---|
-| 0–4 | Web UI log streaming; bottom pane `serialwrap tail -f` | Two clients on one port, live |
+| 0–4 | Web UI log streaming; bottom pane `serialwarden tail -f` | Two clients on one port, live |
 | 4–8 | Top pane: agent calls `wait_for` with `pattern: "boot:|rst:"` (Claude Code using the MCP tool, or a small script against the CLI) | The agent waits without blocking anyone else |
-| 8–10 | Bottom pane: `serialwrap run -- esptool.py --port "$SERIALWRAP_LEASE_PATH" write_flash 0x0 build/app.bin` | No terminal was closed first |
+| 8–10 | Bottom pane: `serialwarden run -- esptool.py --port "$SERIALWARDEN_LEASE_PATH" write_flash 0x0 build/app.bin` | No terminal was closed first |
 | 10–12 | Web UI timeline shows `lease_start`; the tail pane prints the event | The gap is explicit, not a silent disconnect |
 | 12–20 | esptool progress (speed up the middle in the edit, and label it as sped up) | A real flash |
 | 20–23 | `lease_end` with exit code; port reclaimed | The daemon takes the port back by itself |

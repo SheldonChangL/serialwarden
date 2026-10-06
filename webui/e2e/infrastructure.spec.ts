@@ -1,5 +1,5 @@
 // E2E for the web infrastructure foundation (`TASKS.md` T5.1, issue #18).
-// Drives the real compiled `serialwrap daemon` binary + the real built
+// Drives the real compiled `serialwarden daemon` binary + the real built
 // frontend — no mocking of either. Scope is deliberately narrow: this task
 // proves the foundation (WS connects, connection status is honest, one API
 // call renders), not the log view/timeline/approvals/exports that land in

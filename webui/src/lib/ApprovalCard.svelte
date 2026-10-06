@@ -33,7 +33,7 @@
   // passed since that snapshot" against the browser's own clock, ticked by
   // a plain `setInterval` redraw (a UI animation, not a test-synchronization
   // primitive — the actual fail-safe timeout is the daemon's own spawned
-  // task in `crates/serialwrapd/src/gate.rs`; this is only a visual mirror
+  // task in `crates/serialwardend/src/gate.rs`; this is only a visual mirror
   // of it).
   const mountedAtMs = Date.now();
   let nowMs = $state(Date.now());

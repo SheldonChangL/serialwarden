@@ -35,7 +35,7 @@
   <span class="dot" aria-hidden="true"></span>
   <span class="label">{label}</span>
   {#if info.serverVersion}
-    <span class="meta">serialwrapd v{info.serverVersion}</span>
+    <span class="meta">serialwardend v{info.serverVersion}</span>
   {/if}
 </div>
 

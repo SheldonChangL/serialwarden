@@ -8,12 +8,12 @@ name: Release
 #   - Linux tarballs (x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu)
 #     and a .deb for each (via cargo-deb)
 #   - a SHA256SUMS file covering every published asset
-#   - serialwrap.rb, a Homebrew formula pointing at the tarballs above
+#   - serialwarden.rb, a Homebrew formula pointing at the tarballs above
 #     (rendered by packaging/homebrew/render-formula.sh)
 #
 # `install.sh` (repo root) and the rendered Homebrew formula download the
 # tarballs by exactly the name built here
-# (`serialwrap-<tag>-<target-triple>.tar.gz`) - if that naming ever
+# (`serialwarden-<tag>-<target-triple>.tar.gz`) - if that naming ever
 # changes, update all three places together.
 #
 # Linux builds run on ubuntu-22.04 (glibc 2.35), not ubuntu-latest: a
@@ -21,7 +21,7 @@ name: Release
 # older one, and 22.04 is still a common firmware-bench host.
 #
 # The one failure mode this workflow exists specifically to prevent: a
-# release binary whose embedded web GUI is `crates/serialwrapd/build.rs`'s
+# release binary whose embedded web GUI is `crates/serialwardend/build.rs`'s
 # placeholder page because `npm run build` never ran before `cargo build
 # --release` on a release runner (see that file's own doc comment - this
 # is called out there as "the easiest mistake to make and the hardest to
@@ -90,28 +90,28 @@ jobs:
 
       - name: Verify frontend is embedded, not the placeholder
         run: |
-          if grep -q "serialwrap-build-rs-placeholder" webui/dist/index.html; then
+          if grep -q "serialwarden-build-rs-placeholder" webui/dist/index.html; then
             echo "::error::webui/dist/index.html is still build.rs's placeholder after npm run build - refusing to release a binary with a placeholder GUI" >&2
             exit 1
           fi
 
       - name: cargo build --release
-        run: cargo build --release --target ${{ matrix.target }} -p serialwrap
+        run: cargo build --release --target ${{ matrix.target }} -p serialwarden
 
       # The x86_64 build is cross-compiled on an arm64 runner, so only the
       # native one can be executed here.
       - name: Smoke-test the binary
         if: matrix.target == 'aarch64-apple-darwin'
-        run: target/${{ matrix.target }}/release/serialwrap --version
+        run: target/${{ matrix.target }}/release/serialwarden --version
 
       - name: Package tarball
         run: |
           # A dry run from a branch like docs/x would otherwise put a "/"
           # in the file name and package into a subdirectory.
           tag=$(printf '%s' "${GITHUB_REF_NAME:-dev}" | tr '/' '-')
-          name="serialwrap-${tag}-${{ matrix.target }}"
+          name="serialwarden-${tag}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
-          cp "target/${{ matrix.target }}/release/serialwrap" "dist/${name}/serialwrap"
+          cp "target/${{ matrix.target }}/release/serialwarden" "dist/${name}/serialwarden"
           cp README.md LICENSE "dist/${name}/"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           # Checksum from inside dist/ so SHA256SUMS lists bare file names
@@ -160,7 +160,7 @@ jobs:
 
       - name: Verify frontend is embedded, not the placeholder
         run: |
-          if grep -q "serialwrap-build-rs-placeholder" webui/dist/index.html; then
+          if grep -q "serialwarden-build-rs-placeholder" webui/dist/index.html; then
             echo "::error::webui/dist/index.html is still build.rs's placeholder after npm run build - refusing to release a binary with a placeholder GUI" >&2
             exit 1
           fi
@@ -168,20 +168,20 @@ jobs:
       # Native build on each runner (x86_64 and arm64), so the binary lands
       # in target/release/, which is where cargo-deb's asset list expects it.
       - name: cargo build --release
-        run: cargo build --release -p serialwrap
+        run: cargo build --release -p serialwarden
 
       - name: Smoke-test the binary
-        run: target/release/serialwrap --version
+        run: target/release/serialwarden --version
 
       - name: Package tarball
         run: |
           # A dry run from a branch like docs/x would otherwise put a "/"
           # in the file name and package into a subdirectory.
           tag=$(printf '%s' "${GITHUB_REF_NAME:-dev}" | tr '/' '-')
-          name="serialwrap-${tag}-${{ matrix.target }}"
+          name="serialwarden-${tag}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
-          cp target/release/serialwrap "dist/${name}/serialwrap"
-          cp README.md LICENSE packaging/linux/60-serialwrap.rules "dist/${name}/"
+          cp target/release/serialwarden "dist/${name}/serialwarden"
+          cp README.md LICENSE packaging/linux/60-serialwarden.rules "dist/${name}/"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
 
@@ -193,7 +193,7 @@ jobs:
       # the real frontend embedded - letting cargo-deb rebuild would just
       # repeat that work to produce the same binary.
       - name: Build .deb
-        run: cargo deb -p serialwrap --no-build --output dist/
+        run: cargo deb -p serialwarden --no-build --output dist/
 
       - name: sha256sum the .deb
         working-directory: dist
@@ -234,7 +234,7 @@ jobs:
           sha256sum -c SHA256SUMS
 
       - name: Render Homebrew formula
-        run: packaging/homebrew/render-formula.sh "${GITHUB_REF_NAME}" dist/SHA256SUMS > dist/serialwrap.rb
+        run: packaging/homebrew/render-formula.sh "${GITHUB_REF_NAME}" dist/SHA256SUMS > dist/serialwarden.rb
 
       # A tag with a pre-release suffix (v0.2.0-beta.1) is published as a
       # GitHub pre-release, so `releases/latest` (what install.sh follows)
@@ -245,6 +245,6 @@ jobs:
         run: |
           prerelease=""
           case "${GITHUB_REF_NAME}" in *-*) prerelease="--prerelease" ;; esac
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.deb dist/SHA256SUMS dist/serialwrap.rb \
-            --title "serialwrap ${GITHUB_REF_NAME}" \
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.deb dist/SHA256SUMS dist/serialwarden.rb \
+            --title "serialwarden ${GITHUB_REF_NAME}" \
             --generate-notes ${prerelease}

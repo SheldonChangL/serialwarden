@@ -1,6 +1,6 @@
 import { defineConfig } from "@playwright/test";
 
-// This suite spawns real `serialwrap daemon` subprocesses bound to real
+// This suite spawns real `serialwarden daemon` subprocesses bound to real
 // TCP ports (see `daemon.ts`) rather than using Playwright's `webServer`
 // option, because the WS-reconnect scenario needs to kill and restart the
 // server mid-test. `workers: 1` keeps every test's port allocation and

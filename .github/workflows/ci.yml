@@ -118,7 +118,7 @@ jobs:
       # actually run — also re-proves the "assets embedded" acceptance
       # criterion on a from-scratch CI checkout, not just locally.
       - name: Build release daemon binary (embeds the frontend above)
-        run: cargo build --release -p serialwrap
+        run: cargo build --release -p serialwarden
 
       - name: Install Playwright's Chromium
         working-directory: webui
@@ -128,7 +128,7 @@ jobs:
         working-directory: webui
         run: npx playwright test --config=e2e/playwright.config.ts
         env:
-          SERIALWRAP_PROFILE: release
+          SERIALWARDEN_PROFILE: release
 
       - name: Upload Playwright report
         if: always()

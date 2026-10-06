@@ -1092,7 +1092,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "serialwrap"
+name = "serialwarden"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -1102,15 +1102,15 @@ dependencies = [
  "mock-device",
  "nix 0.31.3",
  "serde_json",
- "serialwrapd",
+ "serialwardend",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
- "wrap-proto",
+ "warden-proto",
 ]
 
 [[package]]
-name = "serialwrapd"
+name = "serialwardend"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -1132,7 +1132,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
- "wrap-proto",
+ "warden-proto",
 ]
 
 [[package]]
@@ -1487,6 +1487,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "warden-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1776,14 +1784,6 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "wrap-proto"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "zerocopy"

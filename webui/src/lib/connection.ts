@@ -34,7 +34,7 @@ const INITIAL: ConnectionInfo = {
 };
 
 /**
- * The daemon heartbeats every 2s (`serialwrapd::web::stream::HEARTBEAT_INTERVAL`).
+ * The daemon heartbeats every 2s (`serialwardend::web::stream::HEARTBEAT_INTERVAL`).
  * 7s (3.5 beats) gives slack for one slow tick without flapping the UI, but
  * still catches a wedged connection well before a human would notice on
  * their own.

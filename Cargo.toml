@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wrap-proto",
-    "crates/serialwrapd",
-    "crates/serialwrap",
+    "crates/warden-proto",
+    "crates/serialwardend",
+    "crates/serialwarden",
     "crates/mock-device",
 ]
 
@@ -11,7 +11,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/SheldonChangL/serialwrap"
+repository = "https://github.com/SheldonChangL/serialwarden"
 
 # Shared dependency versions. Every member pulls from this table so upgrades
 # happen in one place and the whole workspace stays on one version of each
@@ -26,17 +26,17 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 clap = { version = "4", features = ["derive"] }
 # `wait_for`'s line-pattern matching (T1.4) — applied only to fully
-# assembled lines, never partial ones (see `serialwrapd::query`).
+# assembled lines, never partial ones (see `serialwardend::query`).
 regex = "1"
 
-# The embedded web GUI (T5.1, issue #18): `serialwrapd::web` serves
+# The embedded web GUI (T5.1, issue #18): `serialwardend::web` serves
 # `GET /api/*`/`WS /api/stream` with axum and embeds `webui/dist` (the
 # built frontend) with rust-embed. Still reserved here (not bumped) for
 # T6.1 packaging, which doesn't add a new crate dependent on either.
 axum = "0.8"
 rust-embed = "8"
 
-# Used by serialwrapd (T1.1) for `available_ports()` enumeration.
+# Used by serialwardend (T1.1) for `available_ports()` enumeration.
 # `default-features = false` drops the "libudev" feature: on Linux that
 # feature links against libudev and requires the `libudev-dev` system
 # package, which is not guaranteed present on a bare CI image (and isn't
@@ -58,7 +58,7 @@ rust-embed = "8"
 # way (not gated by this feature).
 serialport = { version = "4", default-features = false }
 
-# Safe wrappers over poll()/termios, used by serialwrapd's per-device
+# Safe wrappers over poll()/termios, used by serialwardend's per-device
 # reader thread (T1.1: a stop-flag-checking poll loop, not a plain blocking
 # read, is what lets a superseded connection be told to stop and actually
 # join before a new one opens the same device) and already used the same

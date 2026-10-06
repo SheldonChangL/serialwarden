@@ -1,5 +1,5 @@
 // E2E for the live log view (`TASKS.md` T5.2, issue #19). Drives the real
-// compiled `serialwrap daemon` binary (`startDaemon({ testDeviceId })` —
+// compiled `serialwarden daemon` binary (`startDaemon({ testDeviceId })` —
 // see `daemon.ts`'s doc comment on the `TestBackend` seam this needs) and
 // the real built frontend, injecting records through the real
 // recorder->query->presentation->WS/tail pipeline via `injectLog`
@@ -39,7 +39,7 @@ function rxLines(texts: string[]): InjectOp[] {
 test("status bar shows unavailable error counts, never a bare zero", async ({ page }) => {
   await gotoConnectedLiveLog(page);
   const counts = page.getByTestId("error-counts");
-  // `TestBackend::error_counts` (crates/serialwrapd/src/protocol/backend.rs)
+  // `TestBackend::error_counts` (crates/serialwardend/src/protocol/backend.rs)
   // always reports `Unavailable` — it has no real fd/ioctl underneath, same
   // honest reason macOS itself has none. This proves the GUI's rendering
   // of that wire shape (`{"status":"unavailable"}`), independent of which
@@ -90,7 +90,7 @@ test("duplicate lines fold and binary content collapses to a hex chip, both expa
 }) => {
   await gotoConnectedLiveLog(page);
   // Trailing 0x0a is load-bearing: `test/inject`'s `data_b64` op writes raw
-  // bytes as-is (see `crates/serialwrapd/src/web/api.rs`'s `resolve_bytes`
+  // bytes as-is (see `crates/serialwardend/src/web/api.rs`'s `resolve_bytes`
   // doc comment) with no auto-appended newline, and the query layer's line
   // assembler only ever completes a line on an actual `\n` — an
   // unterminated chunk stays an invisible in-progress "partial" forever.

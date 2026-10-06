@@ -2,7 +2,7 @@
  * Pure data model for the live log view (`TASKS.md` T5.2, issue #19):
  * turning the daemon's presented-page JSON (`GET /api/devices/:id/tail`,
  * `WS /api/stream?device=...` pushes — both already run through
- * `serialwrapd::presentation::present`, see `crates/serialwrapd/src/web/api.rs`'s
+ * `serialwardend::presentation::present`, see `crates/serialwardend/src/web/api.rs`'s
  * module doc comment) into a flat, chronologically-ordered array of
  * display items, plus the client-side-only concerns the daemon
  * deliberately doesn't do: regex filtering (a display concern, never
@@ -14,7 +14,7 @@
  * performance acceptance tests, and so the folding/binary-summary logic
  * itself is never reimplemented here — every `LineRender` shape below is a
  * direct decode of what the daemon already computed (see
- * `crates/serialwrapd/src/presentation.rs`'s `LineRender`/`PresentedLine`).
+ * `crates/serialwardend/src/presentation.rs`'s `LineRender`/`PresentedLine`).
  *
  * # Why display timing is derived from `t_wall`, never `t_mono`
  *
@@ -347,7 +347,7 @@ function filterableText(item: LogItem): string | null {
  * acceptance criterion with headroom, while still being small enough that
  * a multi-hour session doesn't grow this without limit — mirrors the
  * daemon's own `DeviceQueryState` "known limitation: unbounded in-memory
- * growth" note (`crates/serialwrapd/src/query.rs`) by at least bounding
+ * growth" note (`crates/serialwardend/src/query.rs`) by at least bounding
  * *this* side of the pipe, even though that one isn't in this task's
  * scope to fix. */
 export const MAX_BUFFERED_ITEMS = 200_000;
@@ -485,7 +485,7 @@ export class LiveLogBuffer {
   /** Drop everything this tab is currently showing.
    *
    * A view-only operation: the daemon's recording is append-only and is not
-   * touched, so the cleared lines remain in `serialwrap tail`, in `export`,
+   * touched, so the cleared lines remain in `serialwarden tail`, in `export`,
    * and in a reload of this page. That distinction is why the control is
    * labelled "Clear view" rather than "Clear" — in a tool whose promise is
    * that nothing is lost, a button that looks like it deletes the log had

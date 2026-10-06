@@ -5,8 +5,8 @@
  * `ExportDialog.svelte`), not by an XHR this module would need to wrap.
  *
  * `GET /api/devices/:id/export` walks the exact same
- * `crate::export::export_range` renderer `serialwrap export` calls
- * in-process (`crates/serialwrapd/src/web/api.rs`'s `export_device` doc
+ * `crate::export::export_range` renderer `serialwarden export` calls
+ * in-process (`crates/serialwardend/src/web/api.rs`'s `export_device` doc
  * comment) — building the right query string here is the *entire*
  * contribution this module makes to the "byte-identical to the CLI"
  * guarantee; the byte-identity itself comes from the daemon side.
