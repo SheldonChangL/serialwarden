@@ -1348,6 +1348,53 @@ mod tests {
     /// every connect/disconnect since the device was first seen. Returning
     /// the whole history here is what left the presentation layer's size cap
     /// with nothing current to spend its budget on.
+    /// Issue #49's reproduction, on the query path agents actually call: a
+    /// device whose recent output is mostly binary, with each binary line's
+    /// summary large against a small cap. Every `tail` must return at least
+    /// one line, never "empty but truncated", and every `n` must report the
+    /// same tip cursor, never one that moves backward.
+    #[test]
+    fn tail_on_a_binary_heavy_device_never_returns_empty_truncated_or_a_backward_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        for _ in 0..20 {
+            recorder.append_event("disconnect", Map::new()).unwrap();
+            recorder.append_event("connect", Map::new()).unwrap();
+        }
+        for i in 0..60u8 {
+            // Undecodable bytes in the shape a baud mismatch produces, several
+            // lines per record, some lines far longer than others.
+            let mut chunk = Vec::new();
+            for j in 0..3u8 {
+                let len = if (i + j) % 7 == 0 { 400 } else { 12 };
+                chunk.extend((0..len).map(|k| 0x80 | (k as u8 ^ i ^ j)));
+                chunk.push(b'\n');
+            }
+            recorder.append_rx(&chunk).unwrap();
+        }
+        let tip = recorder
+            .append_rx(b"\xf7\x08\x32\x08\xc8\x86\n")
+            .unwrap()
+            .seq()
+            + 1;
+        let state = DeviceQueryState::new();
+        state.ingest_to_tip(&recorder);
+
+        let small = crate::presentation::PresentationLimits {
+            max_result_bytes: 600,
+            ..crate::presentation::PresentationLimits::default()
+        };
+        let strict = crate::presentation::PresentationLimits {
+            binary_ratio_threshold: 0.9,
+            ..small.clone()
+        };
+        for (n, limits) in [(3, &small), (4, &small), (25, &small), (12, &strict)] {
+            let page = state.tail_presented(n, None, limits).unwrap();
+            assert!(!page.lines.is_empty(), "tail(n={n}) returned no lines");
+            assert_eq!(page.cursor, tip, "tail(n={n}) must report the tip cursor");
+        }
+    }
+
     #[test]
     fn tail_does_not_return_the_devices_entire_event_history() {
         let tmp = tempfile::tempdir().unwrap();
