@@ -72,9 +72,16 @@ export type ClientRow = ActiveClient | FinishedLease;
 interface ClientsWire {
   clients: ActiveClient[];
   finished_leases: FinishedLease[];
+  /** Older finished leases the daemon left out; only the recent ones are sent. */
+  finished_leases_omitted?: number;
 }
 
-export async function fetchClients(): Promise<ClientRow[]> {
+export interface ClientsPage {
+  rows: ClientRow[];
+  finishedLeasesOmitted: number;
+}
+
+export async function fetchClients(): Promise<ClientsPage> {
   const res = await fetch("/api/clients");
   if (!res.ok) {
     throw new Error(`GET /api/clients failed: ${res.status} ${res.statusText}`);
@@ -83,7 +90,10 @@ export async function fetchClients(): Promise<ClientRow[]> {
   // Active clients first (what an operator most wants to see at a glance),
   // finished leases after — mirrors the UX-design wiki mockup's own
   // top-to-bottom ordering (the two active rows, then the ended lease).
-  return [...body.clients, ...body.finished_leases];
+  return {
+    rows: [...body.clients, ...body.finished_leases],
+    finishedLeasesOmitted: body.finished_leases_omitted ?? 0,
+  };
 }
 
 export type ClientActionOutcome = "ok" | "not_found";

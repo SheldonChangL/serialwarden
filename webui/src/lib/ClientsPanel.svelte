@@ -20,7 +20,7 @@
    * "how much time is left". */
   const POLL_INTERVAL_MS = 2_000;
 
-  type LoadState = { kind: "loading" } | { kind: "error"; message: string } | { kind: "loaded"; rows: ClientRow[] };
+  type LoadState = { kind: "loading" } | { kind: "error"; message: string } | { kind: "loaded"; rows: ClientRow[]; omitted: number };
 
   let panelState = $state<LoadState>({ kind: "loading" });
   let pending = $state<Set<string>>(new Set());
@@ -32,8 +32,8 @@
 
   async function load(): Promise<void> {
     try {
-      const rows = await fetchClients();
-      panelState = { kind: "loaded", rows };
+      const page = await fetchClients();
+      panelState = { kind: "loaded", rows: page.rows, omitted: page.finishedLeasesOmitted };
     } catch (e) {
       panelState = { kind: "error", message: e instanceof Error ? e.message : String(e) };
     }
@@ -160,6 +160,12 @@
         </li>
       {/each}
     </ul>
+    {#if panelState.omitted > 0}
+      <p class="hint" data-testid="clients-omitted">
+        {panelState.omitted} older finished {panelState.omitted === 1 ? "lease" : "leases"} not shown; the Audit panel
+        and <code>serialwarden audit</code> list them.
+      </p>
+    {/if}
   {/if}
 </section>
 
