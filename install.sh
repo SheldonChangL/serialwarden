@@ -40,7 +40,11 @@ set -eu
 REPO="SheldonChangL/serialwarden"
 PREFIX="${SERIALWARDEN_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
-SHARE_DIR="$PREFIX/share/serialwarden"
+# Not $PREFIX/share/serialwarden: with the default prefix that is
+# ~/.local/share/serialwarden, the daemon's own data directory on Linux.
+# Creating it here made the daemon think a legacy serialwrap data directory
+# had already been migrated, and skip moving it.
+SHARE_DIR="$PREFIX/share/doc/serialwarden"
 VERSION="${SERIALWARDEN_VERSION:-latest}"
 DOWNLOAD_BASE="${SERIALWARDEN_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download}"
 
