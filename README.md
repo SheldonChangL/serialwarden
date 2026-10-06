@@ -99,4 +99,4 @@ Upgrading from the old name `serialwrap`? See [docs/setup.md](docs/setup.md#upgr
 - [Wiki](https://github.com/SheldonChangL/serialwarden/wiki): architecture, event stream format, client protocol
 - [CONTRIBUTING.md](CONTRIBUTING.md): building, tests, and reporting hardware bugs
 
-MIT licensed.
+MIT licensed. SerialWarden is free and will stay free. If it saves you time, there is a [Ko-fi page](https://ko-fi.com/sheldonchang); nothing in the software changes either way. A bug report from a real board is worth more.

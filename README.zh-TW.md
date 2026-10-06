@@ -106,4 +106,4 @@ agent 跟板子在同一台電腦：`claude mcp add serialwarden -- serialwarden
 - [Wiki](https://github.com/SheldonChangL/serialwarden/wiki)：架構、事件流格式、client 協定
 - [CONTRIBUTING.md](CONTRIBUTING.md)：編譯、測試、回報實機問題
 
-MIT 授權。
+MIT 授權。SerialWarden 免費，以後也會維持免費。如果它幫你省了時間，可以到 [Ko-fi](https://ko-fi.com/sheldonchang) 支持；有沒有支持，軟體都不會有任何差別。一份來自實機的 bug 回報更有價值。
