@@ -1424,6 +1424,169 @@ async fn set_config_over_the_wire_produces_a_config_change_event_and_never_touch
     println!("acceptance (T2.3) — config_change carries old/new over the wire; prior rx record unchanged: {config_change}");
 }
 
+/// The `set_config` reply says whether the port took the change, and a
+/// change the port rejected is a success (it was saved) that says so, with
+/// the port's error, rather than an unqualified `{"config": ...}`.
+#[tokio::test]
+async fn set_config_reply_reports_whether_the_port_applied_it() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) =
+        start_test_daemon(Arc::clone(&backend) as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "operator", "human").await;
+
+    c.send(json!({"id": 1, "op": "set_config", "device": "dev", "baud": 115200}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["changed"], true, "{reply}");
+    assert_eq!(reply["applied"], true, "{reply}");
+    assert_eq!(reply["apply"], "live", "{reply}");
+    assert!(reply.get("apply_error").is_none(), "{reply}");
+
+    backend.fail_live_apply(Some("Invalid argument (os error 22)".to_string()));
+    c.send(json!({"id": 2, "op": "set_config", "device": "dev", "baud": 74880}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "saved, so still a success: {reply}");
+    assert_eq!(reply["config"]["baud"], 74880, "{reply}");
+    assert_eq!(reply["changed"], true, "{reply}");
+    assert_eq!(reply["applied"], false, "{reply}");
+    assert_eq!(reply["apply"], "failed", "{reply}");
+    assert_eq!(reply["apply_error"], "Invalid argument (os error 22)");
+
+    let outcome: warden_proto::ConfigApplyOutcome =
+        serde_json::from_value(reply.clone()).expect("reply carries ConfigApplyOutcome");
+    assert!(!outcome.applied);
+
+    let records = recorder.read_since(0, usize::MAX).unwrap().records;
+    let applied: Vec<Value> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Event { event, extra, .. } if event == "config_change" => {
+                Some(extra["applied"].clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(applied, vec![json!(true), json!(false)]);
+}
+
+/// `config_change` events in a `read_since` reply, minus the
+/// `system:connect` profile application every connect records.
+fn client_config_changes(read_reply: &Value) -> Vec<Value> {
+    read_reply["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["event"] == "config_change" && e["changed_by"] != "system:connect")
+        .cloned()
+        .collect()
+}
+
+/// Issue #51 over the UDS path the CLI and MCP bridge use, against the real
+/// `LiveBackend` (a `HotplugDetector` driving a PTY mock device), not the
+/// `TestBackend` double: one `set_config` is exactly one `config_change` —
+/// both in the stored stream and in what the daemon's query layer hands
+/// back, which is where the duplicate in the issue was actually produced —
+/// and repeating the request with the configuration already in effect
+/// records nothing.
+#[tokio::test]
+async fn one_set_config_over_the_wire_is_exactly_one_config_change_and_a_repeat_is_none() {
+    use serialwardend::port::testing::ScriptedEnumerator;
+    use serialwardend::port::{EnumeratedDevice, HotplugConfig, HotplugDetector, UsbMetadata};
+    use serialwardend::protocol::backend::LiveBackend;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let device = mock_device::MockDevice::new().expect("open mock device");
+    let usb = UsbMetadata {
+        vid: 0x067b,
+        pid: 0x2303,
+        serial_number: Some("ISSUE-51-UDS".to_string()),
+    };
+    let id = DeviceId::from_usb(&usb).expect("usb id");
+    let enumerator = ScriptedEnumerator::new();
+    enumerator.push(EnumeratedDevice {
+        path: device.slave_path().to_path_buf(),
+        usb: Some(usb),
+    });
+    let detector = HotplugDetector::new(
+        Box::new(enumerator),
+        tmp.path().join("data"),
+        HotplugConfig {
+            poll_interval: Duration::from_millis(5),
+            recorder_config: RecorderConfig::default(),
+        },
+    );
+    let recorders = detector.recorders();
+    let backend = Arc::new(LiveBackend::new(
+        detector.port_config_api(),
+        detector.recorders(),
+    ));
+    let handle = detector.spawn();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backend
+        .list_devices()
+        .iter()
+        .any(|d| d.id == id && d.connected)
+    {
+        assert!(Instant::now() < deadline, "device never connected");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "serialwarden-config", "human").await;
+    let device_id = id.0.clone();
+
+    c.send(json!({"id": 1, "op": "set_config", "device": device_id, "baud": 115200}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "set_config failed: {reply}");
+
+    c.send(json!({"id": 2, "op": "read_since", "device": device_id, "cursor": 0}))
+        .await;
+    let read_reply = c.recv().await;
+    let changes = client_config_changes(&read_reply);
+    assert_eq!(
+        changes.len(),
+        1,
+        "one set_config, one config_change: {changes:?}"
+    );
+    assert_eq!(changes[0]["old"]["baud"], 9600);
+    assert_eq!(changes[0]["new"]["baud"], 115200);
+
+    c.send(json!({"id": 3, "op": "set_config", "device": device_id, "baud": 115200}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "repeat set_config failed: {reply}");
+
+    c.send(json!({"id": 4, "op": "read_since", "device": device_id, "cursor": 0}))
+        .await;
+    let read_reply = c.recv().await;
+    assert_eq!(
+        client_config_changes(&read_reply).len(),
+        1,
+        "old == new must not append a config_change: {read_reply}"
+    );
+
+    // The stored stream agrees with what the query layer returned.
+    let recorder = Arc::clone(recorders.lock().unwrap().get(&id).unwrap());
+    let stored = recorder.read_since(0, usize::MAX).unwrap().records;
+    let stored_changes = stored
+        .iter()
+        .filter(|r| matches!(r, Record::Event { event, .. } if event == "config_change"))
+        .count();
+    assert_eq!(
+        stored_changes, 2,
+        "one system:connect plus one client change"
+    );
+
+    handle.stop();
+}
+
 // ---- T2.3 acceptance criterion (clients): the triple — name, verified pid, type, permission ----
 
 #[tokio::test]

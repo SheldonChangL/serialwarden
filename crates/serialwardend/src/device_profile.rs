@@ -32,7 +32,13 @@
 //!
 //! - `config_change` — a [`crate::port_config::PortConfig`] change
 //!   (baud/data bits/parity/stop bits/flow control), with full old/new
-//!   values and `changed_by`.
+//!   values, `changed_by`, and whether the open port actually took it
+//!   (`applied`/`apply`/`apply_error`, see [`PortApply`]). Never recorded
+//!   for a request that changes nothing (issue #51).
+//! - `config_reapplied` — the saved configuration did not change, but the
+//!   port was not known to be running it (an earlier live apply failed), so
+//!   the request retried the live apply. Recorded because it touched the
+//!   port, under its own name so it never reads as a change.
 //! - `control_line_change` — a manual, single-line DTR or RTS
 //!   assert/deassert.
 //! - `dtr_pulse` — the independently-named reset-shaped operation the
@@ -54,6 +60,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
+use warden_proto::{ConfigApply, ConfigApplyOutcome};
 
 use crate::port_config::PortConfig;
 use crate::query::LineTerminatorMode;
@@ -130,14 +137,109 @@ impl ProfileStore {
     }
 }
 
-/// Append a `config_change` event: full old/new [`PortConfig`] values and
-/// who changed it. `old: None` means "no config has ever been applied to
-/// this device before" (its very first connect, with no saved profile).
+/// What happened at the open port when a configuration was applied to it.
+///
+/// A configuration is always saved before it is applied, so "saved" is
+/// never in question once a request succeeds; this records the other half,
+/// which can fail on its own (see [`ConfigApply`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortApply {
+    pub apply: ConfigApply,
+    /// The port's error, set exactly when `apply` is [`ConfigApply::Failed`].
+    pub error: Option<String>,
+}
+
+impl PortApply {
+    pub fn live() -> Self {
+        Self {
+            apply: ConfigApply::Live,
+            error: None,
+        }
+    }
+
+    pub fn already_applied() -> Self {
+        Self {
+            apply: ConfigApply::AlreadyApplied,
+            error: None,
+        }
+    }
+
+    pub fn not_connected() -> Self {
+        Self {
+            apply: ConfigApply::NotConnected,
+            error: None,
+        }
+    }
+
+    pub fn failed(error: impl std::fmt::Display) -> Self {
+        Self {
+            apply: ConfigApply::Failed,
+            error: Some(error.to_string()),
+        }
+    }
+
+    pub fn applied(&self) -> bool {
+        self.apply.applied()
+    }
+
+    /// Whether the request touched the port at all, as opposed to finding
+    /// nothing to do or having no open port to touch.
+    pub fn attempted(&self) -> bool {
+        matches!(self.apply, ConfigApply::Live | ConfigApply::Failed)
+    }
+
+    fn insert_into(&self, extra: &mut Map<String, serde_json::Value>) {
+        extra.insert("applied".to_string(), self.applied().into());
+        extra.insert(
+            "apply".to_string(),
+            serde_json::to_value(self.apply).unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(error) = &self.error {
+            extra.insert("apply_error".to_string(), error.clone().into());
+        }
+    }
+}
+
+/// Result of a `set_config` request whose configuration was saved: the
+/// resulting configuration, whether it differs from what was saved before,
+/// and what happened at the port.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetConfigOutcome {
+    pub config: PortConfig,
+    pub changed: bool,
+    pub port: PortApply,
+}
+
+impl SetConfigOutcome {
+    pub fn wire(&self) -> ConfigApplyOutcome {
+        ConfigApplyOutcome::new(self.changed, self.port.apply, self.port.error.clone())
+    }
+
+    /// The body every transport replies with for a successful `set_config`
+    /// (UDS and web alike): `config` plus [`ConfigApplyOutcome`]'s fields.
+    pub fn reply_body(&self) -> serde_json::Value {
+        let mut body = Map::new();
+        body.insert(
+            "config".to_string(),
+            serde_json::to_value(&self.config).unwrap_or(serde_json::Value::Null),
+        );
+        if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(self.wire()) {
+            body.extend(fields);
+        }
+        serde_json::Value::Object(body)
+    }
+}
+
+/// Append a `config_change` event: full old/new [`PortConfig`] values, who
+/// changed it, and whether the open port took it (`port`). `old: None` means
+/// "no config has ever been applied to this device before" (its very first
+/// connect, with no saved profile).
 pub fn append_config_change_event(
     recorder: &Recorder,
     old: Option<&PortConfig>,
     new: &PortConfig,
     changed_by: &str,
+    port: &PortApply,
 ) -> io::Result<()> {
     let mut extra = Map::new();
     extra.insert(
@@ -150,7 +252,42 @@ pub fn append_config_change_event(
         serde_json::to_value(new).unwrap_or(serde_json::Value::Null),
     );
     extra.insert("changed_by".to_string(), changed_by.into());
+    port.insert_into(&mut extra);
     recorder.append_event("config_change", extra)?;
+    Ok(())
+}
+
+/// Record what a saved `set_config` request did, and nothing it didn't:
+///
+/// - the configuration changed: one `config_change`, with the port outcome;
+/// - it did not change, but the port was touched (a retry of a live apply
+///   that had failed): one `config_reapplied`, with the port outcome;
+/// - otherwise (nothing changed, port not touched): nothing (issue #51).
+pub fn append_set_config_events(
+    recorder: &Recorder,
+    old: &PortConfig,
+    outcome: &SetConfigOutcome,
+    changed_by: &str,
+) -> io::Result<()> {
+    if outcome.changed {
+        return append_config_change_event(
+            recorder,
+            Some(old),
+            &outcome.config,
+            changed_by,
+            &outcome.port,
+        );
+    }
+    if outcome.port.attempted() {
+        let mut extra = Map::new();
+        extra.insert(
+            "config".to_string(),
+            serde_json::to_value(&outcome.config).unwrap_or(serde_json::Value::Null),
+        );
+        extra.insert("changed_by".to_string(), changed_by.into());
+        outcome.port.insert_into(&mut extra);
+        recorder.append_event("config_reapplied", extra)?;
+    }
     Ok(())
 }
 
@@ -360,7 +497,14 @@ mod tests {
 
         let old = PortConfig::default();
         let new = custom_config();
-        append_config_change_event(&recorder, Some(&old), &new, "cli:sheldon").unwrap();
+        append_config_change_event(
+            &recorder,
+            Some(&old),
+            &new,
+            "cli:sheldon",
+            &PortApply::live(),
+        )
+        .unwrap();
 
         let records = recorder.read_since(0, usize::MAX).unwrap().records;
         let (extra_old, extra_new, changed_by) = records
@@ -390,8 +534,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let recorder = Recorder::open(tmp.path(), "dev", RecorderConfig::default()).unwrap();
 
-        append_config_change_event(&recorder, None, &PortConfig::default(), "system:connect")
-            .unwrap();
+        append_config_change_event(
+            &recorder,
+            None,
+            &PortConfig::default(),
+            "system:connect",
+            &PortApply::live(),
+        )
+        .unwrap();
 
         let records = recorder.read_since(0, usize::MAX).unwrap().records;
         let extra_old = records
@@ -404,6 +554,106 @@ mod tests {
             })
             .unwrap();
         assert!(extra_old.is_null());
+    }
+
+    fn events(recorder: &Recorder) -> Vec<(String, Map<String, serde_json::Value>)> {
+        recorder
+            .read_since(0, usize::MAX)
+            .unwrap()
+            .records
+            .into_iter()
+            .filter_map(|r| match r {
+                Record::Event { event, extra, .. } => Some((event, extra)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A change the port rejected is still one `config_change` (it was
+    /// saved), but it says so: `applied: false` plus the port's error.
+    #[test]
+    fn a_change_the_port_rejected_records_applied_false_and_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = Recorder::open(tmp.path(), "dev", RecorderConfig::default()).unwrap();
+        let outcome = SetConfigOutcome {
+            config: custom_config(),
+            changed: true,
+            port: PortApply::failed("Invalid argument (os error 22)"),
+        };
+        append_set_config_events(&recorder, &PortConfig::default(), &outcome, "gui").unwrap();
+
+        let events = events(&recorder);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let (name, extra) = &events[0];
+        assert_eq!(name, "config_change");
+        assert_eq!(extra["applied"], false);
+        assert_eq!(extra["apply"], "failed");
+        assert_eq!(extra["apply_error"], "Invalid argument (os error 22)");
+        assert_eq!(extra["new"]["baud"], 74_880);
+    }
+
+    #[test]
+    fn a_change_to_a_disconnected_device_is_saved_but_not_applied_and_has_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = Recorder::open(tmp.path(), "dev", RecorderConfig::default()).unwrap();
+        let outcome = SetConfigOutcome {
+            config: custom_config(),
+            changed: true,
+            port: PortApply::not_connected(),
+        };
+        append_set_config_events(&recorder, &PortConfig::default(), &outcome, "gui").unwrap();
+
+        let events = events(&recorder);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1["applied"], false);
+        assert_eq!(events[0].1["apply"], "not_connected");
+        assert!(!events[0].1.contains_key("apply_error"));
+    }
+
+    /// Issue #51's no-op rule, plus the one case an unchanged request still
+    /// touches the port: retrying a live apply that had failed. That retry
+    /// is recorded, but never as a `config_change`.
+    #[test]
+    fn an_unchanged_request_records_nothing_unless_it_retried_the_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = Recorder::open(tmp.path(), "dev", RecorderConfig::default()).unwrap();
+        let config = custom_config();
+        for port in [PortApply::already_applied(), PortApply::not_connected()] {
+            let outcome = SetConfigOutcome {
+                config: config.clone(),
+                changed: false,
+                port,
+            };
+            append_set_config_events(&recorder, &config, &outcome, "gui").unwrap();
+        }
+        assert!(events(&recorder).is_empty(), "a no-op must record nothing");
+
+        let retried = SetConfigOutcome {
+            config: config.clone(),
+            changed: false,
+            port: PortApply::live(),
+        };
+        append_set_config_events(&recorder, &config, &retried, "gui").unwrap();
+        let events = events(&recorder);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "config_reapplied");
+        assert_eq!(events[0].1["applied"], true);
+        assert_eq!(events[0].1["config"]["baud"], 74_880);
+    }
+
+    #[test]
+    fn set_config_reply_body_carries_config_and_outcome_fields() {
+        let outcome = SetConfigOutcome {
+            config: custom_config(),
+            changed: true,
+            port: PortApply::failed("Invalid argument (os error 22)"),
+        };
+        let body = outcome.reply_body();
+        assert_eq!(body["config"]["baud"], 74_880);
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["applied"], false);
+        assert_eq!(body["apply"], "failed");
+        assert_eq!(body["apply_error"], "Invalid argument (os error 22)");
     }
 
     #[test]
@@ -478,13 +728,20 @@ mod tests {
         let before_records = recorder.read_since(0, usize::MAX).unwrap().records;
 
         // Change baud (and every other setting) several times.
-        append_config_change_event(&recorder, None, &PortConfig::default(), "system:connect")
-            .unwrap();
+        append_config_change_event(
+            &recorder,
+            None,
+            &PortConfig::default(),
+            "system:connect",
+            &PortApply::live(),
+        )
+        .unwrap();
         append_config_change_event(
             &recorder,
             Some(&PortConfig::default()),
             &custom_config(),
             "cli:sheldon",
+            &PortApply::live(),
         )
         .unwrap();
         append_config_change_event(
@@ -495,6 +752,7 @@ mod tests {
                 ..PortConfig::default()
             },
             "cli:sheldon",
+            &PortApply::live(),
         )
         .unwrap();
 

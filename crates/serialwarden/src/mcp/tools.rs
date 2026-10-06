@@ -37,7 +37,10 @@
 //!   (`serialwardend::device_profile::append_config_change_event`, called
 //!   from `DeviceBackend::set_config`). This tool exists specifically so an
 //!   agent that suspects it misconfigured the baud rate can verify that
-//!   hypothesis itself (T4.4 acceptance criterion 7).
+//!   hypothesis itself (T4.4 acceptance criterion 7). Its result passes the
+//!   daemon's `changed`/`applied`/`apply`/`apply_error` through: an agent
+//!   testing a baud hypothesis against a port that silently kept the old
+//!   baud would draw exactly the wrong conclusion.
 //! - **`dtr_pulse`**: unlike `set_config`, this physically resets the
 //!   device — a hardware state change, not a display setting — so the
 //!   daemon routes an agent's `dtr_pulse` through the *same* gate `write`
@@ -67,7 +70,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use serialwardend::presentation::{self, PresentationLimits};
-use warden_proto::{Filter, LineEnding, Request};
+use warden_proto::{ConfigApply, ConfigApplyOutcome, Filter, LineEnding, Request};
 
 use super::daemon_client::DaemonClient;
 use super::events::{cap_events, events_cap_bytes, oob_from_wire, CappedEvents, EventWatermarks};
@@ -198,8 +201,31 @@ fn set_config_description() -> String {
          garbage because I have the wrong baud?\") — but it is always recorded prominently in \
          this device's event stream as a `config_change` event (visible to every other client \
          watching this device, and to `serialwarden audit`/`tail`), never silently. Never blocks \
-         waiting for approval.\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
+         waiting for approval. Check `applied` in the result before relying on the new settings: \
+         the configuration is always saved, but the port itself can reject a live change \
+         (`applied: false`, `apply: \"failed\"`, `apply_error`), in which case it keeps running \
+         its previous settings until the device reconnects. `apply: \"not_connected\"` means the \
+         port is not open (unplugged, or leased to another tool) and the settings apply when it next opens.\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
     )
+}
+
+/// Plain-language warning for a `set_config` result an agent must not read as
+/// "the port is now running `config`".
+fn set_config_note(outcome: &ConfigApplyOutcome) -> Option<String> {
+    match outcome.apply {
+        ConfigApply::Live | ConfigApply::AlreadyApplied => None,
+        ConfigApply::NotConnected => Some(
+            "Saved, not applied: the port is not open (device disconnected, or leased to \
+             another tool). It will be applied when the port next opens."
+                .to_string(),
+        ),
+        ConfigApply::Failed => Some(format!(
+            "Saved but NOT applied: the port rejected it ({}). The device is still running its \
+             previous settings, so output read now reflects those, not `config`. It will be \
+             applied when the device reconnects.",
+            outcome.apply_error.as_deref().unwrap_or("no error given")
+        )),
+    }
 }
 
 fn dtr_pulse_description() -> String {
@@ -769,7 +795,32 @@ impl ToolRegistry {
             })
             .await?;
         check_ok(&reply)?;
-        Ok(json!({"result": "allowed", "config": reply["config"]}))
+        let mut result = json!({"result": "allowed", "config": reply["config"]});
+        let Value::Object(fields) = &mut result else {
+            unreachable!("json! object literal");
+        };
+        match serde_json::from_value::<ConfigApplyOutcome>(reply) {
+            Ok(outcome) => {
+                if let Ok(Value::Object(outcome_fields)) = serde_json::to_value(&outcome) {
+                    fields.extend(outcome_fields);
+                }
+                if let Some(note) = set_config_note(&outcome) {
+                    fields.insert("note".to_string(), note.into());
+                }
+            }
+            // A daemon from before these fields existed: the change was
+            // made, but whether the port took it is unknown. Say so rather
+            // than error out of a request that succeeded.
+            Err(_) => {
+                fields.insert(
+                    "note".to_string(),
+                    "Saved. This daemon does not report whether the port applied it; check the \
+                     device's output before relying on the new settings."
+                        .into(),
+                );
+            }
+        }
+        Ok(result)
     }
 
     /// `dtr_pulse` (`TASKS.md` T4.4, issue #17): routed through the same

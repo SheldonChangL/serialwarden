@@ -15,14 +15,20 @@
 //! `config_change`/`control_line_change` event semantics — this subcommand
 //! adds no new daemon-side behavior, only the client side of requests that
 //! already work end-to-end.
+//!
+//! A config write reports what the daemon says happened, not just that the
+//! request succeeded: saved and applied, already in effect, saved for a
+//! disconnected device, or saved but rejected by the port. The last one
+//! exits non-zero, so `serialwarden config --baud N && next-step` does not go
+//! on as if the port were running at `N` (see `warden_proto::ConfigApply`).
 
-use std::io;
+use std::io::{self, Write as _};
 
 use clap::Args;
 use serde_json::Value;
 
 use serialwardend::port_config::{DataBits, FlowControl, OpenControlLines, Parity, StopBits};
-use warden_proto::Request;
+use warden_proto::{ConfigApply, ConfigApplyOutcome, Request};
 
 use super::client::{resolve_device, resolve_socket_path, DaemonClient};
 use super::error::{describe_connect_error, describe_wire_error};
@@ -188,6 +194,8 @@ pub async fn run(args: ConfigArgs) -> io::Result<()> {
     let mut out = stdout.lock();
 
     let wrote_config = !patch.is_empty();
+    let mut config_outcome = None;
+    let mut legacy_daemon = false;
     if wrote_config {
         let reply = client
             .call(Request::SetConfig {
@@ -196,6 +204,11 @@ pub async fn run(args: ConfigArgs) -> io::Result<()> {
             })
             .await?;
         check_ok(&reply, &device)?;
+        // A daemon from before these fields existed replies with just
+        // `config`. The change was still made; say what is not known rather
+        // than fail a request that succeeded.
+        config_outcome = serde_json::from_value::<ConfigApplyOutcome>(reply).ok();
+        legacy_daemon = config_outcome.is_none();
     }
 
     let wrote_control_line = args.dtr.is_some() || args.rts.is_some();
@@ -216,12 +229,61 @@ pub async fn run(args: ConfigArgs) -> io::Result<()> {
         })
         .await?;
     check_ok(&reply, &device)?;
-    print_config(
-        &mut out,
-        &device,
-        &reply,
-        wrote_config || wrote_control_line,
-    )
+    if let Some(outcome) = &config_outcome {
+        writeln!(out, "{}", describe_outcome(&device, outcome))?;
+    } else if legacy_daemon {
+        writeln!(
+            out,
+            "{device}: config saved (this daemon does not report whether the port applied it)"
+        )?;
+    } else if wrote_control_line {
+        writeln!(out, "{device}: control lines updated")?;
+    }
+    print_config(&mut out, &device, &reply)?;
+
+    match config_outcome {
+        Some(ConfigApplyOutcome {
+            apply: ConfigApply::Failed,
+            apply_error,
+            ..
+        }) => Err(io::Error::other(format!(
+            "{device}: the port rejected the new configuration ({}); it is saved but not in \
+             effect",
+            apply_error.as_deref().unwrap_or("no error given")
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// One line saying what a `set_config` did, from the daemon's own outcome
+/// fields. The printed configuration below it is always the *saved* one,
+/// which is only what the port is running when this line says so.
+fn describe_outcome(device: &str, outcome: &ConfigApplyOutcome) -> String {
+    match (outcome.changed, outcome.apply) {
+        (true, ConfigApply::Live) => format!("{device}: config updated and applied to the port"),
+        (false, ConfigApply::Live) => {
+            format!(
+                "{device}: config unchanged; re-applied to the port (its last apply had failed)"
+            )
+        }
+        (_, ConfigApply::AlreadyApplied) => {
+            format!("{device}: config unchanged (already in effect); nothing recorded")
+        }
+        (true, ConfigApply::NotConnected) => format!(
+            "{device}: config saved; the port is not open (device disconnected, or leased), so \
+             it will be applied when the port next opens"
+        ),
+        (false, ConfigApply::NotConnected) => {
+            format!("{device}: config unchanged; the port is not open (disconnected or leased)")
+        }
+        (_, ConfigApply::Failed) => format!(
+            "{device}: config saved but NOT applied: the port rejected it ({}). The port keeps \
+             its previous settings until the device reconnects or is reopened (unplug/replug, or \
+             `serialwarden run {device} -- true`; reopening may toggle DTR/RTS and reset the \
+             board).",
+            outcome.apply_error.as_deref().unwrap_or("no error given")
+        ),
+    }
 }
 
 fn check_ok(reply: &Value, device: &str) -> io::Result<()> {
@@ -234,12 +296,7 @@ fn check_ok(reply: &Value, device: &str) -> io::Result<()> {
     )))
 }
 
-fn print_config(
-    out: &mut impl io::Write,
-    device: &str,
-    reply: &Value,
-    updated: bool,
-) -> io::Result<()> {
+fn print_config(out: &mut impl io::Write, device: &str, reply: &Value) -> io::Result<()> {
     let config = &reply["config"];
     let baud = config["baud"]
         .as_u64()
@@ -259,9 +316,6 @@ fn print_config(
         _ => "preserve".to_string(),
     };
 
-    if updated {
-        writeln!(out, "{device}: config updated")?;
-    }
     writeln!(
         out,
         "{device}\tbaud={baud} data_bits={data_bits} parity={parity} stop_bits={stop_bits} \

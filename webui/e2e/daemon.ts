@@ -112,6 +112,13 @@ export interface StartDaemonOptions {
    * `rulesTomlPath` for why the destination differs by platform.
    */
   rulesToml?: string;
+  /**
+   * With `testDeviceId`: make the test device's port reject every live
+   * config apply with this message, the way a real driver can refuse a
+   * baud the daemon has already saved
+   * (`serialwardend::TEST_BACKEND_APPLY_ERROR_ENV`).
+   */
+  applyError?: string;
 }
 
 /**
@@ -162,6 +169,7 @@ export async function startDaemon(options?: number | StartDaemonOptions): Promis
         XDG_DATA_HOME: home,
         XDG_CONFIG_HOME: home,
         ...(opts.testDeviceId ? { SERIALWARDEN_TEST_BACKEND_DEVICE: opts.testDeviceId } : {}),
+        ...(opts.applyError ? { SERIALWARDEN_TEST_BACKEND_APPLY_ERROR: opts.applyError } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });

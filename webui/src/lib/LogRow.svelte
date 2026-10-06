@@ -26,7 +26,7 @@
   import { BINARY_INLINE_MAX_BYTES, type LogItem } from "./liveLog";
   import type { AnsiSpan } from "./ansi";
   import { describeEvent, type EventTone } from "./eventText";
-  import { setDeviceConfig } from "./logStream";
+  import { notAppliedMessage, setDeviceConfig } from "./logStream";
 
   interface Props {
     item: LogItem;
@@ -150,8 +150,10 @@
     reverting = true;
     revertError = null;
     try {
-      await setDeviceConfig(deviceId, old as Record<string, unknown>);
+      const result = await setDeviceConfig(deviceId, old as Record<string, unknown>);
       onReverted?.();
+      // A revert the port refused is saved, not done; say so on this row.
+      revertError = notAppliedMessage(result);
     } catch (e) {
       revertError = e instanceof Error ? e.message : String(e);
     } finally {

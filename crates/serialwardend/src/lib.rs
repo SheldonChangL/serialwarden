@@ -59,6 +59,13 @@ use std::sync::Arc;
 /// doc — this is CI/E2E-internal plumbing, not a supported feature.
 pub const TEST_BACKEND_DEVICE_ENV: &str = "SERIALWARDEN_TEST_BACKEND_DEVICE";
 
+/// Test-only, alongside [`TEST_BACKEND_DEVICE_ENV`] and ignored without it:
+/// when set, the test device's port rejects every live configuration apply
+/// with this message (see `TestBackend::fail_live_apply`). Lets the E2E suite
+/// drive the GUI through a change that is saved but not applied, which no
+/// PTY can otherwise produce.
+pub const TEST_BACKEND_APPLY_ERROR_ENV: &str = "SERIALWARDEN_TEST_BACKEND_APPLY_ERROR";
+
 /// What the daemon reports as its version — over `hello`, on
 /// `GET /api/health`, and in the web GUI's connection pill.
 ///
@@ -139,6 +146,9 @@ async fn run_with_test_backend(device_id: String) -> std::io::Result<()> {
     )?);
     let test_backend = protocol::backend::testing::TestBackend::new();
     test_backend.register(port::DeviceId(device_id), recorder);
+    if let Ok(error) = std::env::var(TEST_BACKEND_APPLY_ERROR_ENV) {
+        test_backend.fail_live_apply(Some(error));
+    }
     let backend: Arc<dyn protocol::backend::DeviceBackend> = Arc::new(test_backend);
     serve_forever(backend, data_dir).await
 }

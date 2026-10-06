@@ -177,6 +177,295 @@ fn set_port_config_persists_and_is_reapplied_after_reconnect() {
     assert_eq!(saved["config"]["baud"], 74_880);
 }
 
+/// `config_change` records filtered to one `changed_by`.
+fn config_changes_by<'a>(
+    records: &'a [Record],
+    changed_by: &str,
+) -> Vec<&'a serde_json::Map<String, serde_json::Value>> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Event { event, extra, .. }
+                if event == "config_change"
+                    && extra.get("changed_by").and_then(|v| v.as_str()) == Some(changed_by) =>
+            {
+                Some(extra)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Issue #51, against the real `HotplugDetector`/`PortConfigApi` (not the
+/// `TestBackend` double): one `set_port_config` call records exactly one
+/// `config_change`; repeating it with the configuration already in effect
+/// records none; and each (re)connect records exactly one `system:connect`
+/// profile application with `old: null`.
+#[test]
+fn config_change_is_recorded_once_per_real_change_and_once_per_connect() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut device = MockDevice::new().expect("open mock device");
+    let usb = UsbMetadata {
+        vid: 0x067b,
+        pid: 0x2303,
+        serial_number: Some("ISSUE-51".to_string()),
+    };
+    let id = DeviceId::from_usb(&usb).expect("usb id");
+    let old_path = device.slave_path().to_path_buf();
+
+    let enumerator = ScriptedEnumerator::new();
+    enumerator.push(EnumeratedDevice {
+        path: old_path.clone(),
+        usb: Some(usb),
+    });
+    let mut detector = HotplugDetector::new(
+        Box::new(enumerator.clone()),
+        tmp.path().join("data"),
+        tiny_poll_config(),
+    );
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |d| d
+            .recorders()
+            .lock()
+            .unwrap()
+            .contains_key(&id)),
+        "expected initial connect"
+    );
+    let recorder = Arc::clone(detector.recorders().lock().unwrap().get(&id).unwrap());
+    let records = || recorder.read_since(0, usize::MAX).unwrap().records;
+
+    let connects = config_changes_by(&records(), "system:connect").len();
+    assert_eq!(
+        connects, 1,
+        "first connect must record exactly one profile application"
+    );
+    assert!(config_changes_by(&records(), "system:connect")[0]["old"].is_null());
+
+    let api = detector.port_config_api();
+    let custom = PortConfig {
+        baud: 115_200,
+        ..PortConfig::default()
+    };
+    api.set_port_config(&id, custom.clone(), "test:once")
+        .expect("set_port_config");
+    let changes = config_changes_by(&records(), "test:once")
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changes.len(),
+        1,
+        "one set_port_config, one config_change: {changes:?}"
+    );
+    assert_eq!(changes[0]["old"]["baud"], 9600);
+    assert_eq!(changes[0]["new"]["baud"], 115_200);
+
+    // The same configuration again is a no-op, not a second change.
+    api.set_port_config(&id, custom.clone(), "test:once")
+        .expect("repeat set_port_config");
+    assert_eq!(
+        config_changes_by(&records(), "test:once").len(),
+        1,
+        "old == new must not append a config_change"
+    );
+
+    device.disconnect().expect("disconnect");
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |_| event_count(
+            &records(),
+            "disconnect"
+        ) == 1),
+        "expected a disconnect event"
+    );
+    device.reconnect().expect("reconnect");
+    enumerator.replace_path(&old_path, device.slave_path().to_path_buf());
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |_| event_count(
+            &records(),
+            "connect"
+        ) == 2),
+        "expected a reconnect"
+    );
+
+    let after = records();
+    let connects = config_changes_by(&after, "system:connect");
+    assert_eq!(
+        connects.len(),
+        2,
+        "each connect records exactly one profile application, never a duplicate"
+    );
+    assert!(connects[1]["old"].is_null());
+    assert_eq!(connects[1]["new"]["baud"], 115_200);
+    assert_eq!(event_count(&after, "config_change"), 3);
+}
+
+/// The real-hardware failure behind this test: a macOS PL2303 adapter
+/// rejected every live baud change on the daemon's long-lived fd with
+/// `EINVAL`, while the daemon told the caller and the timeline the change
+/// had taken effect. A PTY cannot reproduce that, so the live applier is
+/// replaced with one that fails the same way while `fail` is set.
+#[test]
+fn a_live_apply_the_port_rejects_is_saved_reported_and_recorded_as_not_applied() {
+    use serialwardend::port::LiveConfigApplier;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use warden_proto::ConfigApply;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut device = MockDevice::new().expect("open mock device");
+    let usb = UsbMetadata {
+        vid: 0x067b,
+        pid: 0x23a3,
+        serial_number: Some("PL2303-EINVAL".to_string()),
+    };
+    let id = DeviceId::from_usb(&usb).expect("usb id");
+    let old_path = device.slave_path().to_path_buf();
+    let enumerator = ScriptedEnumerator::new();
+    enumerator.push(EnumeratedDevice {
+        path: old_path.clone(),
+        usb: Some(usb),
+    });
+
+    let fail = Arc::new(AtomicBool::new(true));
+    let fail_in_applier = Arc::clone(&fail);
+    let applier: LiveConfigApplier = Arc::new(move |_fd, _config| {
+        if fail_in_applier.load(Ordering::SeqCst) {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        } else {
+            Ok(())
+        }
+    });
+    let mut detector = HotplugDetector::new(
+        Box::new(enumerator.clone()),
+        tmp.path().join("data"),
+        tiny_poll_config(),
+    )
+    .with_live_config_applier(applier);
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |d| d
+            .recorders()
+            .lock()
+            .unwrap()
+            .contains_key(&id)),
+        "expected initial connect"
+    );
+    let recorder = Arc::clone(detector.recorders().lock().unwrap().get(&id).unwrap());
+    let events = |name: &str| -> Vec<serde_json::Map<String, serde_json::Value>> {
+        recorder
+            .read_since(0, usize::MAX)
+            .unwrap()
+            .records
+            .into_iter()
+            .filter_map(|r| match r {
+                Record::Event { event, extra, .. } if event == name => Some(extra),
+                _ => None,
+            })
+            .collect()
+    };
+    let api = detector.port_config_api();
+    let esp = PortConfig {
+        baud: 74_880,
+        ..PortConfig::default()
+    };
+
+    // The port rejects it: the caller learns that, with the error.
+    let outcome = api
+        .set_port_config(&id, esp.clone(), "test:einval")
+        .expect("a rejected live apply is not an Err: the config was saved");
+    assert!(outcome.changed);
+    assert_eq!(outcome.port.apply, ConfigApply::Failed);
+    let error = outcome.port.error.clone().expect("the port's error");
+    assert!(error.contains("Invalid argument"), "{error}");
+    assert!(!outcome.wire().applied);
+
+    // Saved for the next open regardless.
+    assert_eq!(api.get_config(&id).unwrap().baud, 74_880);
+
+    // The timeline does not claim it was applied.
+    let changes: Vec<_> = events("config_change")
+        .into_iter()
+        .filter(|e| e["changed_by"] == "test:einval")
+        .collect();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["applied"], false);
+    assert_eq!(changes[0]["apply"], "failed");
+    assert_eq!(changes[0]["apply_error"], error.as_str());
+
+    // Asking again for the same config retries the port instead of
+    // claiming it is already in effect, and is not a second change.
+    let retry = api
+        .set_port_config(&id, esp.clone(), "test:einval")
+        .unwrap();
+    assert!(!retry.changed);
+    assert_eq!(retry.port.apply, ConfigApply::Failed);
+    fail.store(false, Ordering::SeqCst);
+    let retry = api
+        .set_port_config(&id, esp.clone(), "test:einval")
+        .unwrap();
+    assert_eq!(retry.port.apply, ConfigApply::Live);
+    let reapplied = events("config_reapplied");
+    assert_eq!(reapplied.len(), 2, "{reapplied:?}");
+    assert_eq!(reapplied[0]["applied"], false);
+    assert_eq!(reapplied[1]["applied"], true);
+
+    // Now the port is running it: the same request is a true no-op.
+    let noop = api
+        .set_port_config(&id, esp.clone(), "test:einval")
+        .unwrap();
+    assert_eq!(noop.port.apply, ConfigApply::AlreadyApplied);
+    assert_eq!(events("config_reapplied").len(), 2);
+    assert_eq!(
+        events("config_change")
+            .iter()
+            .filter(|e| e["changed_by"] == "test:einval")
+            .count(),
+        1
+    );
+
+    // A change while disconnected is saved, says it was not applied, and
+    // carries no error: there was no port to reject it.
+    device.disconnect().expect("disconnect");
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |_| events(
+            "disconnect"
+        )
+        .len()
+            == 1),
+        "expected a disconnect event"
+    );
+    let offline = api
+        .set_port_config(
+            &id,
+            PortConfig {
+                baud: 115_200,
+                ..PortConfig::default()
+            },
+            "test:offline",
+        )
+        .unwrap();
+    assert_eq!(offline.port.apply, ConfigApply::NotConnected);
+    let last = events("config_change").pop().unwrap();
+    assert_eq!(last["changed_by"], "test:offline");
+    assert_eq!(last["applied"], false);
+    assert_eq!(last["apply"], "not_connected");
+    assert!(!last.contains_key("apply_error"));
+
+    // The next open applies the saved config, and its own record says
+    // whether that worked (a PTY rejects macOS's IOSSIOSPEED, so only the
+    // field's presence is portable here).
+    device.reconnect().expect("reconnect");
+    enumerator.replace_path(&old_path, device.slave_path().to_path_buf());
+    assert!(
+        poll_until(&mut detector, Duration::from_secs(2), |_| events("connect")
+            .len()
+            == 2),
+        "expected a reconnect"
+    );
+    let connect_apply = events("config_change").pop().unwrap();
+    assert_eq!(connect_apply["changed_by"], "system:connect");
+    assert_eq!(connect_apply["new"]["baud"], 115_200);
+    assert!(connect_apply["applied"].is_boolean(), "{connect_apply:?}");
+}
+
 /// `PortConfigApi` methods must not silently succeed against a device the
 /// detector has never seen at all.
 #[test]
