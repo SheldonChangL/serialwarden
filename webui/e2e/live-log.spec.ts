@@ -85,6 +85,27 @@ test("data lines and broker events are visually and structurally distinct", asyn
   expect(dataBand).toMatch(/rgba\(.*,\s*0\)/); // transparent on device output
 });
 
+test("gate rows say what the gate did, and a pending request never reads as allowed", async ({
+  page,
+}) => {
+  await gotoConnectedLiveLog(page);
+  await injectLog(daemon!, DEVICE_ID, [
+    { kind: "gate", action: "request", reason: "danger:erase", request_seq: 1 },
+    { kind: "gate", action: "deny", reason: "denied_by_operator:gui", request_seq: 1 },
+    { kind: "gate", action: "request", reason: "pending", request_seq: 2 },
+    { kind: "gate", action: "approve", reason: "approved_by:gui", request_seq: 2 },
+    { kind: "gate", action: "allow", reason: "whitelist:^status$", request_seq: 3 },
+  ]);
+
+  const label = (action: string) =>
+    page.locator(`[data-row-kind="gate"][data-gate-action="${action}"] .label`);
+  await expect(label("request")).toHaveCount(2, { timeout: 10_000 });
+  await expect(label("request").first()).toHaveText("Awaiting approval");
+  await expect(label("deny")).toHaveText("Blocked");
+  await expect(label("approve")).toHaveText("Approved");
+  await expect(label("allow")).toHaveText("Allowed");
+});
+
 test("duplicate lines fold and binary content collapses to a hex chip, both expandable", async ({
   page,
 }) => {

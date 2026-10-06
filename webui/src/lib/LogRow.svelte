@@ -126,6 +126,26 @@
       reverting = false;
     }
   }
+
+  /** The gate's own vocabulary (`serialwardend::gate`): `request` opens a
+   * pending approval, `allow` is a whitelist pass, `approve`/`deny` close a
+   * request. Anything else is shown verbatim rather than guessed at. A
+   * pending request must never read as "Allowed": that is exactly the row an
+   * operator checks to see whether a dangerous write went through. */
+  function gateLabel(action: string): string {
+    switch (action) {
+      case "request":
+        return "Awaiting approval";
+      case "allow":
+        return "Allowed";
+      case "approve":
+        return "Approved";
+      case "deny":
+        return "Blocked";
+      default:
+        return action;
+    }
+  }
 </script>
 
 <!-- Kept to one line: rows are `white-space: pre`, so any formatting
@@ -277,7 +297,7 @@
     style="--tone: var(--gate); --tone-bg: var(--gate-bg);"
   >
     <span class="ts tnum">{timestamp}</span>
-    <span class="label">{item.action === "deny" ? "Blocked" : "Allowed"}</span>
+    <span class="label">{gateLabel(item.action)}</span>
     <span class="detail">{item.reason}</span>
   </div>
 {/if}
