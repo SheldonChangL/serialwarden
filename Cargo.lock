@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "mock-device"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "nix 0.31.3",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "serialwarden"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "chrono",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "serialwardend"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "warden-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
