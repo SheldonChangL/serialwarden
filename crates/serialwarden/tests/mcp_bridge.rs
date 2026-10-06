@@ -642,22 +642,28 @@ async fn disconnect_event_appears_in_the_next_read_tool_calls_result() {
 async fn tail_result_embeds_the_disconnect_event() {
     let (daemon, recorder) = start_daemon_with_empty_device("dev").await;
     recorder
-        .append_rx(b"normal line before disconnect\n")
+        .append_rx(b"normal line before the bridge started\n")
         .expect("append rx");
-    recorder
-        .append_event("disconnect", serde_json::Map::new())
-        .expect("append disconnect event");
-    // No sleep needed before the first query against a fresh device:
-    // `append_rx`/`append_event` are synchronous and durable the instant
-    // they return (fsync only affects crash durability, not readability —
-    // see `Recorder`'s module docs), and `QueryRegistry::get_or_spawn`
-    // performs one synchronous `ingest` the very first time any query
-    // touches a device specifically so its very first caller can never
-    // observe less than what's already on disk. The `tail` call below is
-    // that first call.
 
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
+
+    // The disconnect must happen *after* this session first saw the
+    // device: a fresh bridge starts each device's watermark at its tip, so
+    // anything recorded before that is history, not news (see
+    // `a_fresh_bridge_on_a_long_lived_install_delivers_no_pre_bridge_events`).
+    let baseline = mcp
+        .call_tool("tail", json!({"device": "dev", "n": 10}))
+        .await;
+    assert!(baseline["events"].as_array().unwrap().is_empty());
+    recorder
+        .append_rx(b"normal line before disconnect\n")
+        .expect("append rx");
+    let disconnect = recorder
+        .append_event("disconnect", serde_json::Map::new())
+        .expect("append disconnect event")
+        .seq();
+    wait_until_ingested(&mut mcp, "dev", disconnect).await;
 
     let tail_result = mcp
         .call_tool("tail", json!({"device": "dev", "n": 10}))
@@ -697,16 +703,19 @@ async fn tail_result_embeds_the_disconnect_event() {
 // `tools::ToolRegistry::fetch_new_events`) and still surface it.
 async fn get_config_fetches_the_disconnect_event_separately() {
     let (daemon, recorder) = start_daemon_with_empty_device("dev").await;
-    recorder
-        .append_event("disconnect", serde_json::Map::new())
-        .expect("append disconnect event");
-    // No sleep needed -- same reasoning as `tail_result_embeds_the_disconnect_event`
-    // above: `get_config`'s `fetch_new_events` issues a `QueryEvents`
-    // request, which is this device's first-ever query and therefore gets
-    // `QueryRegistry::get_or_spawn`'s synchronous first ingest.
 
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
+
+    // Same reasoning as `tail_result_embeds_the_disconnect_event`: the
+    // session sees the device first, then the disconnect happens.
+    let baseline = mcp.call_tool("get_config", json!({"device": "dev"})).await;
+    assert!(baseline["events"].as_array().unwrap().is_empty());
+    let disconnect = recorder
+        .append_event("disconnect", serde_json::Map::new())
+        .expect("append disconnect event")
+        .seq();
+    wait_until_ingested(&mut mcp, "dev", disconnect).await;
 
     let config_result = mcp.call_tool("get_config", json!({"device": "dev"})).await;
     let config_events = config_result["events"].as_array().expect("events array");
@@ -1097,11 +1106,13 @@ async fn cursor_pagination_with_folding_and_truncation_matches_a_whole_read() {
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
 
-    // "Whole read": one `tail` call, generous enough that nothing needs
-    // truncating (the wiki's own default 8KB cap is already far more than
-    // this small dataset needs).
+    // "Whole read": one `read_since` from the start, generous enough that
+    // nothing needs truncating (the wiki's own default 8KB cap is already
+    // far more than this small dataset needs). Not `tail`: its `events` are
+    // only those new since this session first saw the device, and the
+    // disconnect above predates the session.
     let whole = mcp
-        .call_tool("tail", json!({"device": "dev", "n": 1000}))
+        .call_tool("read_since", json!({"device": "dev", "cursor": 0}))
         .await;
     assert_eq!(whole["truncated"], false, "whole read: {whole}");
     let whole_trace = expand_presented_lines(whole["lines"].as_array().unwrap());
@@ -1450,3 +1461,292 @@ async fn agent_changes_baud_and_it_takes_effect_and_is_logged() {
 // out here to keep this file's contribution to `cargo test --all`'s ~10s
 // budget (T4.3/T4.4 acceptance criterion 11) proportionate to what it
 // actually adds.
+
+// ---- Context safety of a fresh bridge on a long-lived install ----
+//
+// Field report (v0.1.0, 2026-10-06): a freshly started `serialwarden mcp`'s
+// first `list_devices` returned a 1.39 MB JSON-RPC line, 563 KB of it 1,840
+// historical out-of-band events (every lease_start/lease_end/disconnect/
+// config_change since September, across 33 devices). Every device's event
+// watermark started at seq 0, so "events since your last call" meant "the
+// device's entire history" on the first call. These tests seed thousands of
+// such events *before* the bridge starts and pin both halves of the fix: no
+// pre-bridge event is ever delivered as new, and whatever post-bridge burst
+// does get attached to one result stays under a hard cap with an explicit
+// marker pointing at what was left out.
+
+/// The hard cap on one tool result's `events` array — the presentation
+/// layer's default `max_result_bytes` (see
+/// `serialwardend::presentation::PresentationLimits`).
+const EVENTS_CAP_BYTES: usize = 8 * 1024;
+
+fn open_leaked_recorder(device_id: &str) -> Arc<Recorder> {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let recorder = Arc::new(
+        Recorder::open(data_dir.path(), device_id, RecorderConfig::default()).expect("recorder"),
+    );
+    // Same reasoning as `start_daemon_with_empty_device`: the recorder's
+    // directory must outlive the test.
+    std::mem::forget(data_dir);
+    recorder
+}
+
+async fn start_daemon_with_devices(devices: &[(&str, Arc<Recorder>)]) -> TestDaemon {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("test.sock");
+    let backend = Arc::new(TestBackend::new());
+    for (id, recorder) in devices {
+        backend.register(DeviceId(id.to_string()), Arc::clone(recorder));
+    }
+    let listener = server::bind(&path).expect("bind test socket");
+    let shared = Arc::new(Shared::new(
+        backend as Arc<dyn DeviceBackend>,
+        "test",
+        dir.path(),
+    ));
+    tokio::spawn(server::serve(listener, shared));
+    TestDaemon {
+        socket_path: path,
+        _dir: dir,
+    }
+}
+
+/// Append `count` lease events shaped like the field report's (a realistic
+/// flashing-tool command line each), with a log line every tenth record.
+/// Returns `(first_event_seq, last_event_seq)`.
+fn append_lease_events(recorder: &Recorder, count: usize) -> (u64, u64) {
+    let mut first = None;
+    let mut last = 0;
+    for i in 0..count {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "command".to_string(),
+            json!(format!(
+                "flash-tool --port /dev/ttyUSB0 --image build/firmware-{i:05}.bin --verify --reset-after"
+            )),
+        );
+        extra.insert("pid".to_string(), json!(10_000 + i));
+        let name = if i % 2 == 0 {
+            "lease_start"
+        } else {
+            "lease_end"
+        };
+        let seq = recorder
+            .append_event(name, extra)
+            .expect("append event")
+            .seq();
+        first.get_or_insert(seq);
+        last = seq;
+        if i % 10 == 0 {
+            recorder
+                .append_rx(format!("boot log line {i}\n").as_bytes())
+                .expect("append rx");
+        }
+    }
+    (first.expect("count > 0"), last)
+}
+
+fn json_len(v: &Value) -> usize {
+    v.to_string().len()
+}
+
+/// Block until the daemon's query layer has ingested `device` up to and
+/// including `seq` (its poller runs on an interval). Uses `tail` with
+/// `n = 0`, which carries no events and so never moves the bridge's event
+/// watermark — this observes, it never consumes.
+async fn wait_until_ingested(mcp: &mut McpProcess, device: &str, seq: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = mcp
+            .call_tool("tail", json!({"device": device, "n": 0}))
+            .await;
+        if page["cursor"].as_u64().unwrap_or(0) > seq {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never ingested {device} up to seq {seq} within 5s: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_bridge_on_a_long_lived_install_delivers_no_pre_bridge_events() {
+    let ids = ["dev-a", "dev-b", "dev-c"];
+    let recorders: Vec<Arc<Recorder>> = ids.iter().map(|id| open_leaked_recorder(id)).collect();
+    let mut pre_bridge_tip = std::collections::HashMap::new();
+    let mut history_bytes = 0usize;
+    for (id, recorder) in ids.iter().zip(&recorders) {
+        let (_, last) = append_lease_events(recorder, 2000);
+        pre_bridge_tip.insert(id.to_string(), last);
+        history_bytes += recorder
+            .read_since(0, usize::MAX)
+            .unwrap()
+            .records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap().len())
+            .sum::<usize>();
+    }
+    assert!(
+        history_bytes > 1_000_000,
+        "fixture should be on the field report's scale, got {history_bytes} bytes"
+    );
+    let devices: Vec<(&str, Arc<Recorder>)> =
+        ids.iter().copied().zip(recorders.iter().cloned()).collect();
+    let daemon = start_daemon_with_devices(&devices).await;
+
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+
+    // First list_devices: 6,000 historical events exist, none are new.
+    let listed = mcp.call_tool("list_devices", json!({})).await;
+    let events = listed["events"].as_array().expect("events array");
+    assert!(
+        events.is_empty(),
+        "first list_devices delivered {} pre-bridge events ({} bytes)",
+        events.len(),
+        json_len(&listed["events"])
+    );
+    assert!(json_len(&listed["events"]) <= EVENTS_CAP_BYTES);
+    assert_eq!(listed["events_truncated"], false, "{listed}");
+    assert_eq!(listed["devices"].as_array().unwrap().len(), 3);
+    assert!(
+        json_len(&listed) < 4 * 1024,
+        "first list_devices result is {} bytes",
+        json_len(&listed)
+    );
+
+    // First tail on a device: the recent window is full of lease events,
+    // but they all predate the bridge.
+    let tailed = mcp
+        .call_tool("tail", json!({"device": "dev-a", "n": 50}))
+        .await;
+    let tail_events = tailed["events"].as_array().expect("events array");
+    assert!(
+        tail_events.is_empty(),
+        "first tail delivered {} pre-bridge events",
+        tail_events.len()
+    );
+    assert!(
+        json_len(&tailed) <= EVENTS_CAP_BYTES,
+        "first tail result is {} bytes",
+        json_len(&tailed)
+    );
+
+    // An event that happens after the bridge started is delivered on the
+    // next call, exactly once.
+    let disconnect_b = recorders[1]
+        .append_event("disconnect", serde_json::Map::new())
+        .expect("append disconnect")
+        .seq();
+    wait_until_ingested(&mut mcp, "dev-b", disconnect_b).await;
+    let listed = mcp.call_tool("list_devices", json!({})).await;
+    let events = listed["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1, "{listed}");
+    assert_eq!(events[0]["event"], "disconnect");
+    assert_eq!(events[0]["device"], "dev-b");
+    assert_eq!(events[0]["seq"], disconnect_b);
+    assert!(disconnect_b > pre_bridge_tip["dev-b"]);
+    let config = mcp
+        .call_tool("get_config", json!({"device": "dev-b"}))
+        .await;
+    assert!(
+        config["events"].as_array().unwrap().is_empty(),
+        "an already-delivered event must not repeat: {config}"
+    );
+
+    // Same for `tail`'s own embedded events, on a device whose first sight
+    // was the list_devices call above.
+    let disconnect_c = recorders[2]
+        .append_event("disconnect", serde_json::Map::new())
+        .expect("append disconnect")
+        .seq();
+    wait_until_ingested(&mut mcp, "dev-c", disconnect_c).await;
+    let tailed = mcp
+        .call_tool("tail", json!({"device": "dev-c", "n": 5}))
+        .await;
+    let tail_events = tailed["events"].as_array().expect("events array");
+    assert_eq!(tail_events.len(), 1, "{tailed}");
+    assert_eq!(tail_events[0]["seq"], disconnect_c);
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_post_bridge_event_burst_is_capped_with_an_explicit_marker_and_stays_reachable() {
+    let recorder = open_leaked_recorder("dev");
+    append_lease_events(&recorder, 500);
+    let daemon = start_daemon_with_devices(&[("dev", Arc::clone(&recorder))]).await;
+
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+    let baseline = mcp.call_tool("get_config", json!({"device": "dev"})).await;
+    assert!(
+        baseline["events"].as_array().unwrap().is_empty(),
+        "first get_config delivered {} pre-bridge events",
+        baseline["events"].as_array().unwrap().len()
+    );
+
+    // A burst far larger than one result may carry.
+    let (burst_first, burst_last) = append_lease_events(&recorder, 3000);
+    wait_until_ingested(&mut mcp, "dev", burst_last).await;
+
+    let config = mcp.call_tool("get_config", json!({"device": "dev"})).await;
+    let events = config["events"].as_array().expect("events array");
+    assert!(
+        json_len(&config["events"]) <= EVENTS_CAP_BYTES,
+        "events array is {} bytes",
+        json_len(&config["events"])
+    );
+    assert_eq!(config["events_truncated"], true);
+    let omitted = config["events_omitted"].as_u64().expect("events_omitted") as usize;
+    assert!(!events.is_empty());
+    assert_eq!(
+        omitted + events.len(),
+        3000,
+        "kept + omitted must account for every new event"
+    );
+    // The newest events are the ones kept...
+    assert_eq!(events.last().unwrap()["seq"], burst_last);
+    // ...and the omitted ones are named precisely enough to fetch.
+    let ranges = config["events_omitted_ranges"]
+        .as_array()
+        .expect("events_omitted_ranges");
+    assert_eq!(ranges.len(), 1, "{ranges:?}");
+    assert_eq!(ranges[0]["device"], "dev");
+    assert_eq!(ranges[0]["first_seq"], burst_first);
+    assert_eq!(ranges[0]["count"], omitted as u64);
+    let first_kept = events[0]["seq"].as_u64().unwrap();
+    assert!(ranges[0]["last_seq"].as_u64().unwrap() < first_kept);
+
+    // Reachable: read_since from the range's start returns the very first
+    // omitted event.
+    let page = mcp
+        .call_tool(
+            "read_since",
+            json!({"device": "dev", "cursor": burst_first}),
+        )
+        .await;
+    assert_eq!(page["events"][0]["seq"], burst_first);
+
+    // The watermark moved past the omitted events too: nothing repeats.
+    let again = mcp.call_tool("get_config", json!({"device": "dev"})).await;
+    assert!(again["events"].as_array().unwrap().is_empty(), "{again}");
+    assert_eq!(again["events_truncated"], false);
+
+    // list_devices applies the same cap to its merged, device-tagged array.
+    let (_, burst2_last) = append_lease_events(&recorder, 3000);
+    wait_until_ingested(&mut mcp, "dev", burst2_last).await;
+    let listed = mcp.call_tool("list_devices", json!({})).await;
+    assert!(json_len(&listed["events"]) <= EVENTS_CAP_BYTES);
+    assert_eq!(listed["events_truncated"], true);
+    assert_eq!(
+        listed["events_omitted"].as_u64().unwrap() as usize
+            + listed["events"].as_array().unwrap().len(),
+        3000
+    );
+    assert_eq!(listed["events_omitted_ranges"][0]["device"], "dev");
+
+    mcp.shutdown().await;
+}
