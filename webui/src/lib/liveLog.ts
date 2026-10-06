@@ -103,6 +103,38 @@ function decodeRender(line: PresentedLineJson): LineRender {
   };
 }
 
+/** A binary row of at most this many bytes shows its hex inline, with no
+ * click (issue #48). Longer rows stay collapsed behind "view as hex".
+ *
+ * 32 is the width that still reads as one row: 32 bytes is 95 monospace
+ * columns of hex, and the point of showing it at all is pattern-spotting —
+ * rows that are nearly identical, a regular byte rhythm — which is exactly
+ * what a wrong-baud stream looks like. A 1-byte row has nothing to hide, so
+ * hiding it saved no space and cost a click per row. */
+export const BINARY_INLINE_MAX_BYTES = 32;
+
+/** Two binary rows closer together than this are one burst of bytes, not two
+ * events, and are shown as one run (issue #48).
+ *
+ * The daemon splits a line on every CR/LF *byte*, and a garbled (wrong-baud)
+ * stream is full of them, so one read from the port arrives as several
+ * adjacent "lines" of 1, 4, 6 bytes. Fragments of one read carry the same
+ * timestamp (the issue's log shows three rows at `08:49:46.944`); 20ms also
+ * covers a USB-serial adapter's own flush interval (FTDI's default latency
+ * timer is 16ms). It stays far below the gap between separate bursts (the
+ * issue's are 200ms+ apart), which must remain separate rows — their
+ * similarity to each other is the diagnostic. */
+export const BINARY_MERGE_WINDOW_MS = 20;
+
+/** One source row of a merged binary run — what a hover or expand shows so
+ * every underlying `seq` stays traceable. */
+export interface BinaryPart {
+  seq: number;
+  tWall: string;
+  length: number;
+  hexPreview: string;
+}
+
 /** Every kind of row the live log view can render, plus the client-only
  * synthetic `gap` row. `id` is a locally-assigned, monotonically
  * increasing identifier (not the daemon's `seq`, which folds/gaps don't
@@ -121,6 +153,12 @@ export type LogItem =
       render: LineRender;
       folded: boolean;
       count: number;
+      /** Set only on a merged binary run (two or more adjacent binary
+       * fragments combined by `LiveLogBuffer`, issue #48): the source rows
+       * in order. `seq`/`tWall` are the first fragment's, `lastSeq`/
+       * `lastTWall` the last's, and `render` is the combined run. `null` on
+       * every other row. */
+      parts: BinaryPart[] | null;
     }
   | {
       kind: "tx";
@@ -281,6 +319,7 @@ function lineToItem(line: PresentedLineJson): LogItem {
       render,
       folded: true,
       count: line.count ?? 1,
+      parts: null,
     };
   }
   const tWall = line.t_wall ?? "";
@@ -295,6 +334,41 @@ function lineToItem(line: PresentedLineJson): LogItem {
     render,
     folded: false,
     count: 1,
+    parts: null,
+  };
+}
+
+type LineItem = Extract<LogItem, { kind: "line" }>;
+type BinaryRender = Extract<LineRender, { kind: "binary_summary" }>;
+
+/** A plain (un-folded) binary row — the only kind that merges. A folded run
+ * already says "×N identical", and merging it would erase that count. */
+function isMergeableBinary(item: LogItem): item is LineItem & { render: BinaryRender } {
+  return item.kind === "line" && !item.folded && item.render.kind === "binary_summary";
+}
+
+function partsOf(item: LineItem): BinaryPart[] {
+  if (item.parts) return item.parts;
+  const r = item.render as BinaryRender;
+  return [{ seq: item.seq, tWall: item.tWall, length: r.length, hexPreview: r.hexPreview }];
+}
+
+/** `prev` and `next` combined into one run. A new object (same `id`, so
+ * expand state survives) rather than a mutation, because the row component
+ * receives the item as a prop and only re-renders when it changes identity. */
+function mergeBinary(prev: LineItem, next: LineItem): LineItem {
+  const a = prev.render as BinaryRender;
+  const b = next.render as BinaryRender;
+  return {
+    ...prev,
+    lastSeq: next.lastSeq,
+    lastTWall: next.lastTWall,
+    render: {
+      kind: "binary_summary",
+      length: a.length + b.length,
+      hexPreview: `${a.hexPreview} ${b.hexPreview}`,
+    },
+    parts: [...partsOf(prev), ...partsOf(next)],
   };
 }
 
@@ -414,7 +488,39 @@ export class LiveLogBuffer {
    * mode — `null` until at least one item has been ingested. */
   sessionStartMs: number | null = null;
 
+  /** Fold `item` into the row just before it when both are binary fragments
+   * of one burst (issue #48): adjacent in the buffer — so no text row, event
+   * or gap chip sits between them, since any of those would be the newest
+   * item — and within `BINARY_MERGE_WINDOW_MS` of each other.
+   *
+   * Display-side only, deliberately. The daemon's `PresentedLine`s, the
+   * cursor, `tail`/`read_since`/export and the MCP tools all keep their
+   * per-line records, and every fragment's `seq` stays reachable through
+   * `parts` and the `seq`..`lastSeq` range the timeline jump uses. Merging in
+   * the daemon would change what an agent reading the same log sees. Returns
+   * whether it merged. */
+  private tryMergeBinary(item: LogItem): boolean {
+    if (!isMergeableBinary(item) || this.items.length === 0) return false;
+    const prev = this.items[this.items.length - 1];
+    if (!isMergeableBinary(prev)) return false;
+    if (this.lastNonGapTMs === null || item.tMs - this.lastNonGapTMs > BINARY_MERGE_WINDOW_MS) {
+      return false;
+    }
+    const merged = mergeBinary(prev, item);
+    this.items[this.items.length - 1] = merged;
+    // `filtered` holds `prev` as its last element whenever it matched, and a
+    // binary row always matches (see `matchesFilter`).
+    if (this.filtered[this.filtered.length - 1] === prev) {
+      this.filtered[this.filtered.length - 1] = merged;
+    }
+    this.lastNonGapTMs = item.tMs;
+    const chars = (merged.render as BinaryRender).hexPreview.length;
+    if (chars > this.maxChars) this.maxChars = chars;
+    return true;
+  }
+
   private pushRaw(item: LogItem): void {
+    if (this.tryMergeBinary(item)) return;
     if (item.kind === "line") {
       const chars =
         item.render.kind === "text" ? item.render.text.length : item.render.hexPreview.length;

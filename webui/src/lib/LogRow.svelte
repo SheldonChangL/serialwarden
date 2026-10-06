@@ -23,7 +23,7 @@
    * `LiveLog`'s `.spacer` width): every row shifts together under a single
    * visible scrollbar, exactly like a terminal's own pager.
    */
-  import type { LogItem } from "./liveLog";
+  import { BINARY_INLINE_MAX_BYTES, type LogItem } from "./liveLog";
   import type { AnsiSpan } from "./ansi";
   import { describeEvent, type EventTone } from "./eventText";
   import { setDeviceConfig } from "./logStream";
@@ -61,6 +61,38 @@
   function fmtCount(n: number): string {
     return n.toLocaleString();
   }
+
+  /** Short binary rows show their bytes without a click (issue #48): the
+   * moment a screen fills with binary is almost always a baud mismatch, and
+   * telling that apart from real traffic needs the bytes — rows nearly
+   * identical, a regular rhythm — not a count behind a click per row. The
+   * daemon's preview holds 64 bytes, so anything at or under the inline
+   * threshold is the complete hex, never a truncated one. */
+  function showsHexInline(length: number): boolean {
+    return length <= BINARY_INLINE_MAX_BYTES;
+  }
+
+  /** The low-ratio-invalid-utf8 case carries its whole hex as `rawHex`, so
+   * its byte count is just the number of hex tokens. */
+  function rawHexLength(rawHex: string): number {
+    return rawHex === "" ? 0 : rawHex.split(" ").length;
+  }
+
+  /** True when an expanded long run shows fewer bytes than it has — the
+   * daemon previews only the first 64 bytes of each line. */
+  function hexIsTruncated(length: number, hexPreview: string): boolean {
+    return hexPreview.split(" ").length < length;
+  }
+
+  /** What a merged run was made of, for the hover title: every source row's
+   * `seq`, time and size, so the fragments stay traceable to the log. */
+  const fragmentsTitle = $derived(
+    item.kind === "line" && item.parts
+      ? item.parts
+          .map((p) => `seq ${p.seq} · ${p.tWall} · ${p.length} byte${p.length === 1 ? "" : "s"}`)
+          .join("\n")
+      : undefined,
+  );
 
   /** Split `text` into alternating plain/matched segments for the highlight
    * mode. A global-flag clone is used so the caller's regex `lastIndex` is
@@ -178,6 +210,8 @@
             >{#if item.render.spans}{@render ansiText(item.render.spans)}{:else}{item.render
                 .text}{/if}</span
           >
+        {:else if showsHexInline(item.render.length)}
+          <span class="hex" data-testid="binary-hex">{item.render.hexPreview}</span>
         {:else}
           <span class="text dim">{item.render.length} bytes of binary</span>
         {/if}
@@ -188,15 +222,45 @@
             >{/if}</span
         >
       </button>
+    {:else if item.render.kind === "binary_summary" && showsHexInline(item.render.length)}
+      <!-- Short binary: the bytes themselves, no toggle — see
+           `showsHexInline`. A merged run says so and lists its fragments on
+           hover rather than pretending to be one device write. -->
+      <span class="binary-inline" title={fragmentsTitle}
+        ><span class="hex" data-testid="binary-hex">{item.render.hexPreview}</span
+        >{#if item.parts}<span class="meta" data-testid="binary-parts"
+            >· {item.parts.length} fragments</span
+          >{/if}</span
+      >
     {:else if item.render.kind === "binary_summary"}
-      <button type="button" class="inline-toggle binary-toggle" onclick={() => onToggleExpand(item.id)}>
+      <button
+        type="button"
+        class="inline-toggle binary-toggle"
+        title={fragmentsTitle}
+        onclick={() => onToggleExpand(item.id)}
+      >
         {#if expanded}
-          <span class="hex">{item.render.hexPreview}</span>
+          <span class="hex" data-testid="binary-hex"
+            >{item.render.hexPreview}{#if hexIsTruncated(item.render.length, item.render.hexPreview)}
+              …{/if}</span
+          >
+          {#if item.parts}<span class="meta" data-testid="binary-parts"
+              >· {item.render.length} bytes in {item.parts.length} fragments</span
+            >{/if}
         {:else}
           <span class="text dim">{item.render.length} bytes of binary</span>
+          {#if item.parts}<span class="meta" data-testid="binary-parts"
+              >· {item.parts.length} fragments</span
+            >{/if}
           <span class="meta affordance">· view as hex</span>
         {/if}
       </button>
+    {:else if item.render.rawHex !== null && showsHexInline(rawHexLength(item.render.rawHex))}
+      <span class="text"
+        >{#if item.render.spans}{@render ansiText(item.render.spans)}{:else}{item.render
+            .text}{/if}</span
+      >
+      <span class="hex" data-testid="binary-hex">{item.render.rawHex}</span>
     {:else if item.render.rawHex !== null}
       <button type="button" class="inline-toggle binary-toggle" onclick={() => onToggleExpand(item.id)}>
         <span class="text"
@@ -404,6 +468,13 @@
     font: inherit;
     cursor: pointer;
     padding: 0;
+    white-space: pre;
+  }
+
+  .binary-inline {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
     white-space: pre;
   }
 

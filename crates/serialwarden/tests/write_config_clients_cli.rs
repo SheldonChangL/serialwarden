@@ -583,13 +583,12 @@ async fn audit_listing_shows_full_traceability_matches_export_format_and_filters
         "text: {text}"
     );
     assert!(text.contains("gate=human_rw"), "text: {text}");
-    // The written bytes are fully recoverable -- `cli::render`'s existing
-    // tx rendering treats the trailing `\n` `write`'s default line ending
-    // appends as a control byte, so a short payload like this renders as a
-    // `[N bytes binary — hex]` summary rather than plain text (same
-    // behavior `tail` already has for a tx echo) -- the exact hex is still
-    // the complete, unambiguous original bytes, not truncated.
-    assert!(text.contains("6f 6b 0a"), "text: {text}");
+    // The written bytes are fully recoverable: `write`'s default line ending
+    // is a trailing `\n`, which is a terminator, not binary (issue #48), so
+    // the payload shows as text with the terminator escaped, not as a
+    // `[N bytes binary]` summary.
+    assert!(text.contains("gate=human_rw ok\\n"), "text: {text}");
+    assert!(!text.contains("bytes binary"), "text: {text}");
 
     // The denied write: full traceability even though it never produced a
     // `tx` record -- requester identity, matched rule, and the *complete*
