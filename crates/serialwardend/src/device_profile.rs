@@ -67,7 +67,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
-use warden_proto::{ConfigApply, ConfigApplyOutcome};
+use warden_proto::{ConfigApply, ConfigApplyOutcome, PortApplyState};
 
 use crate::port_config::PortConfig;
 use crate::query::LineTerminatorMode;
@@ -244,6 +244,95 @@ impl PortApply {
         if let Some(error) = &self.nonblocking_error {
             extra.insert("nonblocking_error".to_string(), error.clone().into());
         }
+    }
+}
+
+/// What the daemon knows about the configuration one device's open port is
+/// running. Shared by `port::LiveDeviceConfig` and the `TestBackend` double so
+/// both answer "is the port running the saved config?" by the same rules.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PortTracking {
+    /// Known exactly: the most recent application to the open port
+    /// succeeded. `None` after a failure (the port's state is then unknown)
+    /// and when no port is open.
+    running: Option<PortConfig>,
+    /// The last configuration the open port accepted. Kept after a later
+    /// failed application, so a client can say what the port was left on.
+    last_applied: Option<PortConfig>,
+    /// The error from the most recent application, when it failed.
+    last_error: Option<String>,
+}
+
+impl PortTracking {
+    /// What the open port is known to be running, if anything.
+    pub fn running(&self) -> Option<&PortConfig> {
+        self.running.as_ref()
+    }
+
+    /// The port was just opened and `config` applied to it (`port` says
+    /// how that went). A fresh fd: nothing from before it carries over.
+    pub fn opened(&mut self, config: &PortConfig, port: &PortApply) {
+        let applied = port.applied().then(|| config.clone());
+        self.running = applied.clone();
+        self.last_applied = applied;
+        self.last_error = port.error.clone();
+    }
+
+    /// `config` was applied live to the already open port.
+    pub fn applied_live(&mut self, config: &PortConfig, port: &PortApply) {
+        if port.applied() {
+            self.running = Some(config.clone());
+            self.last_applied = Some(config.clone());
+            self.last_error = None;
+        } else {
+            self.running = None;
+            self.last_error = port.error.clone();
+        }
+    }
+
+    /// The port was closed (disconnect, or handed to a lease).
+    pub fn closed(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Compare with the `saved` configuration: is the port running it?
+    pub fn state(&self, saved: &PortConfig, connected: bool) -> PortApplyState {
+        if !connected {
+            return PortApplyState {
+                applied: false,
+                apply: ConfigApply::NotConnected,
+                apply_error: None,
+                last_applied: None,
+            };
+        }
+        if self.running.as_ref() == Some(saved) {
+            return PortApplyState {
+                applied: true,
+                apply: ConfigApply::Live,
+                apply_error: None,
+                last_applied: None,
+            };
+        }
+        PortApplyState {
+            applied: false,
+            apply: ConfigApply::Failed,
+            apply_error: self.last_error.clone(),
+            // Even when it equals `saved`: "last accepted the saved config,
+            // but a later apply failed" is not the same as "running it".
+            last_applied: self
+                .last_applied
+                .as_ref()
+                .and_then(|c| serde_json::to_value(c).ok()),
+        }
+    }
+}
+
+/// [`PortApplyState`]'s fields, to merge into a `get_config` reply body next
+/// to `config` (UDS and web alike).
+pub fn port_state_fields(state: &PortApplyState) -> Map<String, serde_json::Value> {
+    match serde_json::to_value(state) {
+        Ok(serde_json::Value::Object(fields)) => fields,
+        _ => Map::new(),
     }
 }
 
@@ -686,6 +775,39 @@ mod tests {
         assert_eq!(events[0].0, "config_reapplied");
         assert_eq!(events[0].1["applied"], true);
         assert_eq!(events[0].1["config"]["baud"], 74_880);
+    }
+
+    /// `get_config`'s answer to "is the port running the saved config?":
+    /// after a refused change it isn't, it says why, and what the port was
+    /// left on.
+    #[test]
+    fn port_tracking_reports_running_last_accepted_and_the_error() {
+        let saved = custom_config();
+        let previous = PortConfig::default();
+        let mut port = PortTracking::default();
+        assert_eq!(port.state(&saved, false).apply, ConfigApply::NotConnected);
+
+        port.opened(&previous, &PortApply::live());
+        port.applied_live(&saved, &PortApply::failed("Invalid argument (os error 22)"));
+        let state = port.state(&saved, true);
+        assert!(!state.applied);
+        assert_eq!(state.apply, ConfigApply::Failed);
+        assert_eq!(
+            state.apply_error.as_deref(),
+            Some("Invalid argument (os error 22)")
+        );
+        assert_eq!(state.last_applied.unwrap()["baud"], 9600, "left on 9600");
+        assert_eq!(port.running(), None, "a failed apply leaves it unknown");
+
+        port.applied_live(&saved, &PortApply::live());
+        let state = port.state(&saved, true);
+        assert!(state.applied);
+        assert_eq!(state.apply, ConfigApply::Live);
+        assert!(state.apply_error.is_none() && state.last_applied.is_none());
+
+        port.closed();
+        assert_eq!(port.state(&saved, true).apply, ConfigApply::Failed);
+        assert!(port.state(&saved, true).last_applied.is_none());
     }
 
     /// An open whose baud took but whose port stayed non-blocking records

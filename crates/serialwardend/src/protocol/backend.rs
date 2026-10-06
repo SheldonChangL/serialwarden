@@ -39,6 +39,9 @@ pub trait DeviceBackend: Send + Sync {
     fn list_devices(&self) -> Vec<DeviceSummary>;
     fn recorder(&self, id: &DeviceId) -> Option<Arc<Recorder>>;
     fn get_config(&self, id: &DeviceId) -> io::Result<PortConfig>;
+    /// Whether `id`'s open port is running the saved configuration — see
+    /// `port::PortConfigApi::port_state`.
+    fn port_state(&self, id: &DeviceId) -> io::Result<warden_proto::PortApplyState>;
     /// Merge `patch` (a partial `PortConfig` field set — see
     /// `warden_proto::Request::SetConfig`'s docs) onto the current
     /// configuration, save it, and apply it to the open port. Returns the
@@ -165,6 +168,10 @@ impl DeviceBackend for LiveBackend {
         self.config_api.get_config(id)
     }
 
+    fn port_state(&self, id: &DeviceId) -> io::Result<warden_proto::PortApplyState> {
+        self.config_api.port_state(id)
+    }
+
     fn set_config(
         &self,
         id: &DeviceId,
@@ -261,9 +268,9 @@ pub mod testing {
     struct Entry {
         recorder: Arc<Recorder>,
         config: PortConfig,
-        /// Mirrors `port::LiveDeviceConfig::live_config`: what the
-        /// (imaginary) open port is running, `None` after a failed apply.
-        live_config: Option<PortConfig>,
+        /// Mirrors `port::LiveDeviceConfig::port`: what the (imaginary)
+        /// open port is known to be running.
+        port: crate::device_profile::PortTracking,
         path: Option<std::path::PathBuf>,
         connected: bool,
         /// A writable fd a test registered via [`TestBackend::register_writer`]
@@ -331,7 +338,14 @@ pub mod testing {
                     Entry {
                         recorder,
                         config: PortConfig::default(),
-                        live_config: Some(PortConfig::default()),
+                        port: {
+                            let mut port = crate::device_profile::PortTracking::default();
+                            port.opened(
+                                &PortConfig::default(),
+                                &crate::device_profile::PortApply::live(),
+                            );
+                            port
+                        },
                         path: None,
                         connected: true,
                         writer: None,
@@ -364,7 +378,14 @@ pub mod testing {
                 .get_mut(id)
             {
                 entry.connected = connected;
-                entry.live_config = connected.then(|| entry.config.clone());
+                if connected {
+                    let config = entry.config.clone();
+                    entry
+                        .port
+                        .opened(&config, &crate::device_profile::PortApply::live());
+                } else {
+                    entry.port.closed();
+                }
             }
         }
 
@@ -439,7 +460,8 @@ pub mod testing {
                     None => PortApply::live(),
                     Some(e) => PortApply::failed(e),
                 };
-                entry.live_config = port.applied().then(|| entry.config.clone());
+                let config = entry.config.clone();
+                entry.port.opened(&config, &port);
                 (Arc::clone(&entry.recorder), entry.config.clone(), port)
             };
             if let Err(e) = crate::device_profile::append_config_change_event(
@@ -498,6 +520,17 @@ pub mod testing {
                 })
         }
 
+        fn port_state(&self, id: &DeviceId) -> io::Result<warden_proto::PortApplyState> {
+            self.devices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                .map(|e| e.port.state(&e.config, e.connected))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
+                })
+        }
+
         /// Same decisions and events as `port::PortConfigApi::set_port_config`,
         /// against in-memory state: unchanged and already running (or no port)
         /// is a no-op; otherwise save, "apply" (failing if
@@ -525,7 +558,7 @@ pub mod testing {
             let changed = old != merged;
             let port = if !entry.connected {
                 PortApply::not_connected()
-            } else if !changed && entry.live_config.as_ref() == Some(&merged) {
+            } else if !changed && entry.port.running() == Some(&merged) {
                 PortApply::already_applied()
             } else {
                 match live_apply_error {
@@ -535,7 +568,7 @@ pub mod testing {
             };
             entry.config = merged.clone();
             if port.attempted() {
-                entry.live_config = port.applied().then(|| merged.clone());
+                entry.port.applied_live(&merged, &port);
             }
             let recorder = Arc::clone(&entry.recorder);
             drop(devices);

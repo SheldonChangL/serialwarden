@@ -640,15 +640,16 @@ async fn dispatch(
                         .backend
                         .error_counts(&dev)
                         .unwrap_or(crate::error_counts::ErrorCounts::Unavailable);
-                    send(
-                        shared,
-                        client_id,
-                        tx,
-                        ok_reply(
-                            id,
-                            serde_json::json!({ "config": config, "error_counts": error_counts }),
-                        ),
-                    );
+                    let mut body =
+                        serde_json::json!({ "config": config, "error_counts": error_counts });
+                    // Whether the port runs that saved `config` (see
+                    // `warden_proto::PortApplyState`).
+                    if let (serde_json::Value::Object(body), Ok(state)) =
+                        (&mut body, shared.backend.port_state(&dev))
+                    {
+                        body.extend(crate::device_profile::port_state_fields(&state));
+                    }
+                    send(shared, client_id, tx, ok_reply(id, body));
                 }
                 Err(e) => send(
                     shared,

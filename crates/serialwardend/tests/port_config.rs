@@ -1156,3 +1156,62 @@ fn a_stalled_live_apply_on_one_device_does_not_block_opening_another() {
     assert_eq!(outcome.port.apply, warden_proto::ConfigApply::Live);
     handle.stop();
 }
+
+/// What `get_config` reports as the port's state, against the real detector:
+/// after the port refuses a change, the saved config is not running, with
+/// the error and what the port last accepted; once a change takes, it is.
+#[test]
+fn port_state_says_whether_the_port_runs_the_saved_config() {
+    use serialwardend::port::LiveConfigApplier;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use warden_proto::ConfigApply;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let device = MockDevice::new().expect("open mock device");
+    let fail = Arc::new(AtomicBool::new(false));
+    let fail_in_applier = Arc::clone(&fail);
+    let applier: LiveConfigApplier = Arc::new(move |_fd, _config| {
+        if fail_in_applier.load(Ordering::SeqCst) {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        } else {
+            Ok(())
+        }
+    });
+    let (handle, id, _enumerator) =
+        spawn_one_device(&tmp.path().join("data"), &device, "PORT-STATE", |d| {
+            d.with_live_config_applier(applier)
+        });
+    let api = handle.port_config_api();
+    assert!(
+        wait_for(Duration::from_secs(5), || api
+            .port_state(&id)
+            .is_ok_and(|s| s.apply == ConfigApply::Live)),
+        "the open port should be running the saved default"
+    );
+
+    fail.store(true, Ordering::SeqCst);
+    let esp = PortConfig {
+        baud: 74_880,
+        ..PortConfig::default()
+    };
+    api.set_port_config(&id, esp.clone(), "test:state").unwrap();
+    let state = api.port_state(&id).unwrap();
+    assert!(!state.applied);
+    assert_eq!(state.apply, ConfigApply::Failed);
+    assert!(
+        state
+            .apply_error
+            .as_deref()
+            .is_some_and(|e| e.contains("Invalid argument")),
+        "{state:?}"
+    );
+    assert_eq!(state.last_applied.unwrap()["baud"], 9600);
+
+    fail.store(false, Ordering::SeqCst);
+    api.set_port_config(&id, esp, "test:state").unwrap();
+    let state = api.port_state(&id).unwrap();
+    assert!(state.applied, "{state:?}");
+    assert!(state.apply_error.is_none() && state.last_applied.is_none());
+
+    handle.stop();
+}

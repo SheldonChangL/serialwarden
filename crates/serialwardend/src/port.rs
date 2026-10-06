@@ -85,7 +85,9 @@ use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::device_profile::{self, DeviceProfile, PortApply, ProfileStore, SetConfigOutcome};
+use crate::device_profile::{
+    self, DeviceProfile, PortApply, PortTracking, ProfileStore, SetConfigOutcome,
+};
 use crate::error_counts::{self, ErrorCounts};
 use crate::port_config::PortConfig;
 use crate::port_io::{self, ControlLine};
@@ -850,13 +852,13 @@ struct LiveDeviceConfig {
     /// on-disk [`ProfileStore`]; it just has no live fd to re-apply to
     /// until the device reconnects (see `HotplugDetector::attempt_open`).
     fd: Option<Arc<File>>,
-    /// The configuration `fd` is known to be running: set whenever applying
-    /// one to it succeeded (on open, or by a live `set_port_config`), and
-    /// `None` when there is no fd or the last application failed, leaving
-    /// the port's settings unknown. This is what lets an unchanged
-    /// `set_port_config` tell "already in effect, nothing to do" apart from
-    /// "saved, but the port never took it" (worth retrying).
-    live_config: Option<PortConfig>,
+    /// What `fd` is known to be running (see [`PortTracking`]): updated on
+    /// every application to it (on open, or by a live `set_port_config`),
+    /// cleared with the fd. This is what lets an unchanged `set_port_config`
+    /// tell "already in effect, nothing to do" apart from "saved, but the
+    /// port never took it" (worth retrying), and what `get_config` reports
+    /// as `applied`/`last_applied`.
+    port: PortTracking,
     /// The path last seen for this device (T1.4's `list_devices`): set on
     /// first sight and updated on every successful (re)connect, left
     /// untouched across a disconnect so a currently-unplugged device still
@@ -1273,7 +1275,7 @@ impl HotplugDetector {
                     LiveDeviceConfig {
                         profile,
                         fd: None,
-                        live_config: None,
+                        port: PortTracking::default(),
                         path: Some(dev.path.clone()),
                     },
                 );
@@ -1355,7 +1357,7 @@ impl HotplugDetector {
                     .get_mut(&id)
                 {
                     entry.fd = Some(Arc::clone(&file));
-                    entry.live_config = port_apply.applied().then(|| config.clone());
+                    entry.port.opened(&config, &port_apply);
                     entry.path = Some(dev.path.clone());
                 }
 
@@ -1468,7 +1470,7 @@ impl HotplugDetector {
             .get_mut(id)
         {
             entry.fd = None;
-            entry.live_config = None;
+            entry.port.closed();
         }
     }
 
@@ -1834,7 +1836,7 @@ impl HotplugDetector {
             .get_mut(id)
         {
             entry.fd = Some(Arc::clone(&file));
-            entry.live_config = port_apply.applied().then_some(config);
+            entry.port.opened(&config, &port_apply);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -2190,6 +2192,21 @@ impl PortConfigApi {
             })
     }
 
+    /// Whether `id`'s open port is running its saved configuration (see
+    /// [`PortTracking::state`]) — what `get_config` reports next to the
+    /// saved `config`. Errors with [`io::ErrorKind::NotFound`] if `id` has
+    /// never been seen.
+    pub fn port_state(&self, id: &DeviceId) -> io::Result<warden_proto::PortApplyState> {
+        self.configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|entry| entry.port.state(&entry.profile.config, entry.fd.is_some()))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
+            })
+    }
+
     /// Change `id`'s port configuration (baud/data bits/parity/stop
     /// bits/flow control/open-time DTR-RTS policy): persist it (so a
     /// future reconnect — or daemon restart — re-applies it, see
@@ -2262,7 +2279,7 @@ impl PortConfigApi {
             if !changed {
                 let nothing_to_do = match &entry.fd {
                     None => Some(PortApply::not_connected()),
-                    Some(_) if entry.live_config.as_ref() == Some(&new_config) => {
+                    Some(_) if entry.port.running() == Some(&new_config) => {
                         Some(PortApply::already_applied())
                     }
                     Some(_) => None,
@@ -2310,7 +2327,7 @@ impl PortConfigApi {
                 // reconnect in between already recorded what the new fd
                 // is running.
                 if entry.fd.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, fd)) {
-                    entry.live_config = port.applied().then(|| new_config.clone());
+                    entry.port.applied_live(&new_config, &port);
                 }
             }
         }

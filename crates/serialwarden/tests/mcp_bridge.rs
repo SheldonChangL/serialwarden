@@ -1497,6 +1497,17 @@ async fn set_config_tells_the_agent_when_the_port_did_not_apply_it() {
     let note = result["note"].as_str().expect("a note for the agent");
     assert!(note.contains("NOT applied"), "{note}");
 
+    // get_config says the same afterwards: saved 74880, port not on it.
+    let config = mcp.call_tool("get_config", json!({"device": "dev"})).await;
+    assert_eq!(config["config"]["baud"], 74880, "{config}");
+    assert_eq!(config["applied"], false, "{config}");
+    assert_eq!(config["apply"], "failed", "{config}");
+    assert_eq!(
+        config["apply_error"], "Invalid argument (os error 22)",
+        "{config}"
+    );
+    assert_eq!(config["last_applied"]["baud"], 9600, "{config}");
+
     mcp.shutdown().await;
 }
 
