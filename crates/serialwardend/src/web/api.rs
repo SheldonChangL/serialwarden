@@ -45,8 +45,8 @@
 //!   [`GUI_CHANGED_BY`] for the identity string these use in place of a
 //!   kernel-verified UDS peer.
 //! - [`get_config`] additionally computes `decode_health` — see
-//!   [`compute_decode_health`]'s doc comment for why this API didn't already
-//!   exist and what it measures.
+//!   [`crate::baud_hint`] (issue #50) for what it measures and how the
+//!   suggested rate is inferred from the device's own recorded history.
 //!
 //! # The operator's write path
 //!
@@ -98,6 +98,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::baud_hint;
 use crate::export::{ExportError, ExportRange};
 use crate::gate::approval::{DecideError, Decision};
 use crate::gate::{GateDecision, RequesterCtx, DEFAULT_LOG_CONTEXT_LINES};
@@ -105,7 +106,7 @@ use crate::port::DeviceId;
 use crate::presentation::{event_to_json, page_to_json, PresentationLimits};
 use crate::protocol::registry::Activity;
 use crate::protocol::Shared;
-use crate::query::{AssembledLine, OobRecord, QueryError};
+use crate::query::{OobRecord, QueryError};
 use warden_proto::{ClientType, ExportBound, ExportFormat, Filter, LineEnding, Permission};
 
 /// Identity string the GUI's ungated config/control-line/approval endpoints
@@ -274,13 +275,15 @@ async fn get_config(
             // a one-shot `GET` here must not report stale decode health
             // while it waits for that tick.
             state.ingest(&recorder);
-            let lines = state
-                .tail(DECODE_HEALTH_WINDOW_LINES, None)
-                .map(|page| page.lines)
-                .unwrap_or_default();
-            compute_decode_health(&lines, config.baud)
+            // Issue #50: inferred from the device's own recorded evidence —
+            // raw recent bytes (so an all-binary stream with no line breaks
+            // still counts), the rate each earlier line was read at, and any
+            // chip banner in that text. See `crate::baud_hint`.
+            let config_changes = state.query_events(&["config_change".to_string()], None, None);
+            let recent = state.recent_rx(None);
+            state.with_lines(|lines| baud_hint::infer(config.baud, &recent, lines, &config_changes))
         }
-        None => DecodeHealth::default(),
+        None => baud_hint::DecodeHealth::default(),
     };
     Json(json!({
         "config": config,
@@ -474,150 +477,6 @@ fn backend_error_response(e: &std::io::Error, device: &str) -> axum::response::R
         Json(json!({ "error": { "code": "invalid_request", "message": e.to_string() } })),
     )
         .into_response()
-}
-
-/// How many of a device's most-recently-assembled lines [`compute_decode_health`]
-/// inspects. Small and fixed (not "since last config change" or similar) —
-/// this is meant to answer "is what's arriving *right now* decodable",
-/// which a short recent window does better than an ever-growing one that
-/// would dilute a genuinely garbled stream with clean history from before a
-/// baud mismatch started.
-const DECODE_HEALTH_WINDOW_LINES: usize = 50;
-
-/// Below this many sampled bytes, [`compute_decode_health`] never suggests a
-/// baud change — a one- or two-line sample is too small for "most of this
-/// is undecodable" to mean anything (a single stray byte would swing the
-/// ratio wildly).
-const DECODE_HEALTH_MIN_BYTES: usize = 32;
-
-/// Fraction of undecodable bytes at/above which [`compute_decode_health`]
-/// suggests an alternate baud. The UX-design wiki's own mockup example is a
-/// dramatic 92%; this is deliberately far more sensitive (any baud mismatch
-/// this task has actually observed — e.g. 9600 vs. 115200 — corrupts most
-/// bytes almost immediately, not marginally), while still comfortably above
-/// the noise a handful of genuinely binary bytes in otherwise-clean text
-/// would produce.
-const DECODE_HEALTH_THRESHOLD: f64 = 0.2;
-
-/// Common baud rates [`suggest_alternate_baud`] picks from, in the order
-/// they're tried — 115200 and 74880 first because they're this project's
-/// own two most-cited rates (the UX-design wiki's mockup names both: a
-/// generic "commonly wrong" default and the ESP8266 boot-log rate this
-/// whole feature was motivated by), the rest a standard descending list.
-const COMMON_BAUD_CANDIDATES: &[u32] = &[115_200, 74_880, 9600, 57_600, 38_400, 19_200, 230_400];
-
-/// Count how many bytes of `bytes` are part of an invalid UTF-8 sequence —
-/// the raw measurement [`compute_decode_health`]'s ratio is built from.
-/// Walks `str::from_utf8`'s own error reporting rather than reimplementing
-/// UTF-8 validation: `Utf8Error::valid_up_to` is the prefix that *did*
-/// decode, and `Utf8Error::error_len` is `Some(n)` for a genuinely invalid
-/// n-byte sequence or `None` only for a truncated sequence at the very end
-/// of the slice (which, since there's no more input coming in a
-/// point-in-time sample like this, is counted as undecodable too — treating
-/// it as "fine" would understate exactly the case a real baud mismatch
-/// produces at a chunk boundary).
-fn count_invalid_utf8_bytes(bytes: &[u8]) -> usize {
-    let mut invalid = 0usize;
-    let mut offset = 0usize;
-    loop {
-        let rest = &bytes[offset..];
-        match std::str::from_utf8(rest) {
-            Ok(_) => break,
-            Err(e) => {
-                let valid_up_to = e.valid_up_to();
-                let bad_len = e.error_len().unwrap_or(rest.len() - valid_up_to);
-                invalid += bad_len;
-                offset += valid_up_to + bad_len;
-                if offset >= bytes.len() {
-                    break;
-                }
-            }
-        }
-    }
-    invalid
-}
-
-/// Pick a baud to suggest instead of `current` — the first entry in
-/// [`COMMON_BAUD_CANDIDATES`] that isn't `current` itself. Deliberately not
-/// an attempt to *derive* the device's actual correct baud from the garbled
-/// bytes themselves: a wrong-baud UART mismatch corrupts bits during
-/// sampling, not just framing, so there is no decode-and-compare trick that
-/// recovers the right rate from already-corrupted bytes after the fact —
-/// only reopening the port at a candidate rate and checking would (out of
-/// this task's scope: `port*.rs` is explicitly off-limits). This is
-/// consequently a *suggestion* in the same spirit as the UX-design wiki's
-/// own mockup text ("this chip commonly boots at 74880"): a reasonable
-/// next-thing-to-try, not a measurement.
-fn suggest_alternate_baud(current: u32) -> u32 {
-    COMMON_BAUD_CANDIDATES
-        .iter()
-        .copied()
-        .find(|&b| b != current)
-        .unwrap_or(115_200)
-}
-
-/// Result of [`compute_decode_health`] — serialized directly as `GET
-/// /api/devices/:id/config`'s `decode_health` field.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-struct DecodeHealth {
-    /// Total raw bytes sampled (across up to [`DECODE_HEALTH_WINDOW_LINES`]
-    /// recent lines) — `0` when the device has no assembled lines yet.
-    checked_bytes: usize,
-    /// `count_invalid_utf8_bytes(sampled) / checked_bytes`, or `0.0` when
-    /// `checked_bytes` is `0` (nothing sampled is not the same claim as
-    /// "everything sampled decoded fine", but there's also nothing here to
-    /// warn about either).
-    undecodable_ratio: f64,
-    /// `Some(baud)` only when both [`DECODE_HEALTH_MIN_BYTES`] and
-    /// [`DECODE_HEALTH_THRESHOLD`] are met — see [`suggest_alternate_baud`].
-    suggested_baud: Option<u32>,
-}
-
-impl Default for DecodeHealth {
-    fn default() -> Self {
-        Self {
-            checked_bytes: 0,
-            undecodable_ratio: 0.0,
-            suggested_baud: None,
-        }
-    }
-}
-
-/// Whether recent output looks like it's arriving at the wrong baud rate,
-/// and if so, what to try instead (`TASKS.md` T5.3, issue #20's "亂碼偵測建
-/// 議" requirement). This API did not exist before this task — confirmed by
-/// grepping this crate for any existing undecodable-ratio/baud-suggestion
-/// logic before writing this (none found) — so it's added here, scoped to
-/// exactly this one piece of read-only observability: no new persisted
-/// state, no change to how bytes are recorded or decoded elsewhere (`raw`
-/// stays the untouched source of truth everywhere else in this crate; this
-/// function only ever samples it to compute a ratio for display).
-///
-/// `lines` should be the device's most-recently-assembled
-/// [`AssembledLine`]s (see [`get_config`]'s call site: `DeviceQueryState::tail`)
-/// — each already has its terminating `\n` stripped and its exact original
-/// bytes in `raw` (never `text`, which is already lossily re-encoded and
-/// would hide the very thing this function measures).
-fn compute_decode_health(lines: &[AssembledLine], current_baud: u32) -> DecodeHealth {
-    let mut checked_bytes = 0usize;
-    let mut invalid = 0usize;
-    for line in lines {
-        checked_bytes += line.raw.len();
-        invalid += count_invalid_utf8_bytes(&line.raw);
-    }
-    let undecodable_ratio = if checked_bytes == 0 {
-        0.0
-    } else {
-        invalid as f64 / checked_bytes as f64
-    };
-    let suggested_baud = (checked_bytes >= DECODE_HEALTH_MIN_BYTES
-        && undecodable_ratio >= DECODE_HEALTH_THRESHOLD)
-        .then(|| suggest_alternate_baud(current_baud));
-    DecodeHealth {
-        checked_bytes,
-        undecodable_ratio,
-        suggested_baud,
-    }
 }
 
 /// One synthetic record [`test_inject`] can append. Deliberately mirrors
@@ -1789,112 +1648,6 @@ mod tests {
         assert_eq!(body["error"]["code"], "invalid_request");
     }
 
-    // ---- T5.3 (issue #20): decode-health / baud-suggestion pure functions ----
-
-    #[test]
-    fn count_invalid_utf8_bytes_is_zero_for_clean_ascii() {
-        assert_eq!(count_invalid_utf8_bytes(b"boot ok, all good here"), 0);
-    }
-
-    #[test]
-    fn count_invalid_utf8_bytes_counts_a_lone_continuation_byte() {
-        // A single stray 0xFF is exactly one invalid byte, not the whole
-        // buffer — a baud-mismatch stream is mostly garbage, but this
-        // pins that a single bad byte among otherwise-clean text doesn't
-        // get over-counted.
-        let bytes = b"before\xFFafter";
-        assert_eq!(count_invalid_utf8_bytes(bytes), 1);
-    }
-
-    #[test]
-    fn count_invalid_utf8_bytes_counts_every_byte_of_a_fully_garbled_run() {
-        let bytes: Vec<u8> = (0..40).map(|i| 0x80u8.wrapping_add(i)).collect();
-        assert_eq!(count_invalid_utf8_bytes(&bytes), bytes.len());
-    }
-
-    #[test]
-    fn count_invalid_utf8_bytes_counts_a_truncated_multibyte_sequence_at_the_end() {
-        // 0xE0 alone starts a 3-byte sequence with no continuation bytes to
-        // follow — `Utf8Error::error_len()` is `None` for this (a
-        // "could still become valid with more input" case), and this
-        // function's own doc comment says that's still counted as
-        // undecodable for a point-in-time sample with no more input coming.
-        let bytes = b"ok\xE0";
-        assert_eq!(count_invalid_utf8_bytes(bytes), 1);
-    }
-
-    #[test]
-    fn suggest_alternate_baud_never_returns_the_current_value() {
-        for candidate in COMMON_BAUD_CANDIDATES {
-            assert_ne!(suggest_alternate_baud(*candidate), *candidate);
-        }
-        // A baud not in the candidate list at all still gets a real
-        // suggestion (the first candidate), not e.g. itself.
-        assert_eq!(suggest_alternate_baud(1_234_567), 115_200);
-    }
-
-    fn line_with_raw(raw: &[u8]) -> crate::query::AssembledLine {
-        crate::query::AssembledLine {
-            raw: raw.to_vec(),
-            text: String::from_utf8_lossy(raw).into_owned(),
-            seq: 0,
-            t_mono: 0.0,
-            t_wall: "t0".to_string(),
-            capped: false,
-        }
-    }
-
-    #[test]
-    fn compute_decode_health_reports_no_suggestion_for_clean_text() {
-        let lines = vec![
-            line_with_raw(b"I (312) wifi: connected, ip 192.168.1.44"),
-            line_with_raw(b"I (530) sensor: init ok, 4 channels"),
-        ];
-        let health = compute_decode_health(&lines, 115_200);
-        assert_eq!(health.undecodable_ratio, 0.0);
-        assert_eq!(health.suggested_baud, None);
-    }
-
-    #[test]
-    fn compute_decode_health_suggests_a_different_baud_for_a_mostly_garbled_sample() {
-        let garbled: Vec<u8> = (0..200).map(|i| 0x80u8.wrapping_add(i as u8)).collect();
-        let lines = vec![line_with_raw(&garbled)];
-        let health = compute_decode_health(&lines, 9600);
-        assert!(health.checked_bytes >= DECODE_HEALTH_MIN_BYTES);
-        assert!(
-            health.undecodable_ratio >= DECODE_HEALTH_THRESHOLD,
-            "{health:?}"
-        );
-        let suggested = health.suggested_baud.expect("expected a suggestion");
-        assert_ne!(
-            suggested, 9600,
-            "must never suggest the already-wrong baud back"
-        );
-    }
-
-    #[test]
-    fn compute_decode_health_withholds_a_suggestion_below_the_minimum_sample_size() {
-        // Two garbled bytes is a 100% ratio but far below
-        // `DECODE_HEALTH_MIN_BYTES` — a real baud mismatch corrupts a lot
-        // more than this, and a suggestion off a 2-byte sample would be
-        // noise, not signal.
-        let lines = vec![line_with_raw(&[0xFF, 0xFE])];
-        let health = compute_decode_health(&lines, 115_200);
-        assert_eq!(health.undecodable_ratio, 1.0);
-        assert_eq!(
-            health.suggested_baud, None,
-            "sample too small to act on despite a 100% ratio"
-        );
-    }
-
-    #[test]
-    fn compute_decode_health_is_empty_for_no_lines() {
-        let health = compute_decode_health(&[], 115_200);
-        assert_eq!(health.checked_bytes, 0);
-        assert_eq!(health.undecodable_ratio, 0.0);
-        assert_eq!(health.suggested_baud, None);
-    }
-
     // ---- T5.3 (issue #20): GET /config surfaces decode_health end to end ----
 
     #[tokio::test]
@@ -1909,10 +1662,55 @@ mod tests {
         let (status, body) = get(crate::web::router(shared), "/api/devices/dev-1/config").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            body["decode_health"]["undecodable_ratio"].as_f64().unwrap() >= DECODE_HEALTH_THRESHOLD,
+            body["decode_health"]["undecodable_ratio"].as_f64().unwrap()
+                >= baud_hint::UNDECODABLE_THRESHOLD,
             "{body}"
         );
         assert!(body["decode_health"]["suggested_baud"].is_u64(), "{body}");
+        assert_eq!(
+            body["decode_health"]["suggestion"]["baud"], body["decode_health"]["suggested_baud"],
+            "{body}"
+        );
+    }
+
+    /// Issue #50 end to end, with the issue's own data: the RTL8735B
+    /// banner at 115200, then download-mode bytes with no line break at
+    /// all (so not one assembled line) — the suggestion is 1500000, it
+    /// names its basis, and it carries the fingerprint's source.
+    #[tokio::test]
+    async fn config_endpoint_infers_the_rate_from_a_recorded_chip_banner() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        for _ in 0..3 {
+            recorder
+                .append_rx(
+                    b"voe   :RTL8735B_VOE_1.7.1.0\r\nSet H264 default HIGH profile\r\n\
+                      [video_pre_init_procedure] START\r\n",
+                )
+                .unwrap();
+        }
+        let download_mode: &[u8] = &[
+            0xf7, 0x08, 0x32, 0x08, 0xc8, 0x86, 0x84, 0x08, 0x04, 0x85, 0xe6, 0xc4, 0x08, 0x08,
+            0x88, 0x8f, 0x08, 0x3e, 0x06, 0x81, 0xe6, 0xc4, 0x08, 0x08, 0x88, 0x8f, 0x08, 0x3f,
+            0x06, 0x87, 0xe6, 0xf4, 0x08,
+        ];
+        for _ in 0..4 {
+            recorder.append_rx(download_mode).unwrap();
+        }
+
+        let (status, body) = get(crate::web::router(shared), "/api/devices/dev-1/config").await;
+        assert_eq!(status, StatusCode::OK);
+        let health = &body["decode_health"];
+        assert_eq!(health["text_lines"], 9, "{body}");
+        assert_eq!(health["suggested_baud"], 1_500_000, "{body}");
+        assert_eq!(health["suggestion"]["basis"], "fingerprint", "{body}");
+        assert_eq!(health["suggestion"]["mode_switch"], true, "{body}");
+        assert_eq!(
+            health["suggestion"]["fingerprint"]["source_url"],
+            "https://aiot.realmcu.com/en/latest/tools/image_tool/index.html",
+            "{body}"
+        );
+        assert!(health["newest_sample_t_wall"].is_string(), "{body}");
     }
 
     #[tokio::test]

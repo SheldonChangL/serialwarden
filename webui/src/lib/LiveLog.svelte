@@ -21,7 +21,7 @@
    *   read the rest.
    * - **The baud warning is on screen, not in a popover.** The daemon
    *   already computes "this looks undecodable, try 115200"
-   *   (`compute_decode_health`), but it only ever appeared inside the port
+   *   (`decode_health`), but it only ever appeared inside the port
    *   settings popover — i.e. only to someone who already suspected the
    *   baud rate. It now sits above the log, where the garbage is.
    *
@@ -43,6 +43,7 @@
   import { stripAnsi } from "./ansi";
   import { harvest } from "./completion";
   import { formatConfig } from "./eventText";
+  import { describeOutcome, runBaudTrial, trialRunning, type TrialOutcome } from "./baudTrial";
   import LogRow from "./LogRow.svelte";
   import Timeline from "./Timeline.svelte";
   import PortSettingsPopover from "./PortSettingsPopover.svelte";
@@ -112,7 +113,10 @@
   let streamErrorDetail = $state<string | null>(null);
   let deviceConfig = $state<DeviceConfig | null>(null);
   let recordingSinceLabel = $state<string | null>(null);
-  let applyingSuggestedBaud = $state(false);
+  /** The rate a one-click trial is currently trying (issue #50), and how
+   * the last one ended — see `baudTrial.ts`. */
+  let tryingBaud = $state<number | null>(null);
+  let trialOutcome = $state<TrialOutcome | null>(null);
 
   let popoverOpen = $state(false);
   let configChipEl: HTMLButtonElement | undefined = $state();
@@ -467,8 +471,9 @@
   /** How stale the newest output can be before this view stops calling it
    * "recent".
    *
-   * `compute_decode_health` samples the last `DECODE_HEALTH_WINDOW_LINES`
-   * assembled lines with no bound on how old they are, so a device that
+   * The daemon (`crates/serialwardend/src/baud_hint.rs`) samples the newest
+   * bytes recorded since the baud last changed, with no bound on how old
+   * they are, so a device that
    * emitted a garbled burst and then went quiet keeps reporting the same
    * ratio over the same stale bytes indefinitely — the suggestion never
    * expires on its own. Warning about output that stopped arriving an hour
@@ -488,11 +493,21 @@
    * re-arm a warning about bytes that arrived hours earlier. */
   const lastArrivalMs = $derived.by((): number | null => {
     trackVersion();
+    let newest: number | null = null;
     for (let i = buffer.items.length - 1; i >= 0; i--) {
       const item = buffer.items[i];
-      if (item.kind === "line") return item.tMs;
+      if (item.kind === "line") {
+        newest = item.tMs;
+        break;
+      }
     }
-    return null;
+    // Issue #50: a stream that stopped being text often stops completing
+    // lines too (a download protocol rarely sends `\n`), so this view may
+    // have no line item for it at all. The daemon reports when the bytes it
+    // sampled arrived, line or not.
+    const sampled = Date.parse(deviceConfig?.decode_health?.newest_sample_t_wall ?? "");
+    if (!Number.isNaN(sampled)) newest = newest === null ? sampled : Math.max(newest, sampled);
+    return newest;
   });
 
   const suggestedBaud = $derived.by((): number | null => {
@@ -508,19 +523,34 @@
     Math.round((deviceConfig?.decode_health?.undecodable_ratio ?? 0) * 100),
   );
 
-  async function applySuggestedBaud(): Promise<void> {
-    if (suggestedBaud === null || applyingSuggestedBaud) return;
-    applyingSuggestedBaud = true;
-    try {
-      await setDeviceConfig(deviceId, { baud: suggestedBaud });
-      refreshConfig();
-    } catch {
-      // The failure is already visible: the config chip doesn't change and
-      // no `config_change` row appears. Surfacing a second error string in
-      // a one-click banner would be noise.
-    } finally {
-      applyingSuggestedBaud = false;
-    }
+  const suggestion = $derived(deviceConfig?.decode_health?.suggestion ?? null);
+
+  /** One-click try with automatic revert (issue #50) — see `baudTrial.ts`.
+   * The outcome sentence stays on screen after the banner itself goes away
+   * (a reverted trial resets the sample, so the warning disappears until
+   * new garbage arrives), because "it was switched back" is exactly the
+   * thing the operator must not miss. */
+  async function trySuggestedBaud(): Promise<void> {
+    const health = deviceConfig?.decode_health;
+    const previous = Number(deviceConfig?.config.baud);
+    if (suggestedBaud === null || !health || Number.isNaN(previous)) return;
+    if (tryingBaud !== null || trialRunning(deviceId)) return;
+    tryingBaud = suggestedBaud;
+    trialOutcome = null;
+    trialOutcome = await runBaudTrial(
+      deviceId,
+      previous,
+      suggestedBaud,
+      { checked_bytes: health.checked_bytes, undecodable_ratio: health.undecodable_ratio },
+      {
+        fetchConfig: fetchDeviceConfig,
+        setConfig: setDeviceConfig,
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        now: () => Date.now(),
+      },
+    );
+    tryingBaud = null;
+    refreshConfig();
   }
 
   /** One consistent clock format for everything in this pane. The footer
@@ -569,31 +599,39 @@
     {/if}
   </div>
 
-  {#if suggestedBaud !== null}
+  {#if suggestedBaud !== null && tryingBaud === null}
     <!-- The daemon already knew this; it just wasn't saying it anywhere the
          person staring at the garbage would look.
 
-         Wording matters here. `suggest_alternate_baud` picks the first entry
-         in a list of common rates that isn't the current one — its own doc
-         comment says a wrong-baud mismatch corrupts bits during sampling, so
-         the correct rate cannot be recovered from the already-corrupted
-         bytes. The only measured claim is the undecodable ratio; the rate is
-         a next-thing-to-try. Saying anything stronger ("these bytes fit 74880
-         better") would send someone confidently to a rate nothing measured. -->
-    <div class="baud-warning" role="status" data-testid="baud-warning">
+         Wording matters here. The only measured claim is the undecodable
+         ratio; the rate is inferred (`crates/serialwardend/src/baud_hint.rs`)
+         and the daemon's `explanation` says from what — this device's own
+         history at other rates, a chip banner in its log (with the source
+         for that chip's rate), or, with neither, a direction or just the
+         next common rate. It never claims a reading off the garbled bytes,
+         because a wrong-baud capture has already lost the bits. -->
+    <div class="baud-warning" role="status" data-testid="baud-warning" data-basis={suggestion?.basis}>
       <span>
         {undecodablePct}% of recent output didn't decode as text — often a baud mismatch.
-        <span class="qualifier">
-          {suggestedBaud} is just the next common rate to try, not a reading off these bytes.
+        <span class="qualifier" data-testid="baud-warning-basis">
+          {suggestion?.explanation ?? `${suggestedBaud} is just the next common rate to try, not a reading off these bytes.`}
+          {#if suggestion?.fingerprint}
+            <a
+              data-testid="baud-warning-source"
+              href={suggestion.fingerprint.source_url}
+              target="_blank"
+              rel="noopener noreferrer">Source</a
+            >
+          {/if}
         </span>
       </span>
       <button
         type="button"
         data-testid="baud-warning-apply"
-        disabled={applyingSuggestedBaud}
-        onclick={applySuggestedBaud}
+        title="Switches to this rate, measures for a few seconds, and switches back if it doesn't decode better"
+        onclick={trySuggestedBaud}
       >
-        {applyingSuggestedBaud ? "Switching…" : `Try ${suggestedBaud}`}
+        Try {suggestedBaud}
       </button>
       <button
         type="button"
@@ -602,6 +640,18 @@
         title="Some firmware legitimately sends binary — dismiss if that's this board"
         onclick={() => (baudWarningDismissed = true)}
       >
+        Dismiss
+      </button>
+    </div>
+  {/if}
+  {#if tryingBaud !== null}
+    <div class="baud-warning" role="status" data-testid="baud-trial-banner" data-state="running">
+      <span>Trying {tryingBaud} — measuring what arrives at it…</span>
+    </div>
+  {:else if trialOutcome}
+    <div class="baud-warning" role="status" data-testid="baud-trial-banner" data-state={trialOutcome.kind}>
+      <span>{describeOutcome(trialOutcome)}</span>
+      <button type="button" class="dismiss" data-testid="baud-trial-dismiss" onclick={() => (trialOutcome = null)}>
         Dismiss
       </button>
     </div>
@@ -842,6 +892,10 @@
   .baud-warning .qualifier {
     color: var(--text-dim);
     font-size: var(--text-xs);
+  }
+
+  .baud-warning a {
+    color: inherit;
   }
 
   .baud-warning .dismiss {

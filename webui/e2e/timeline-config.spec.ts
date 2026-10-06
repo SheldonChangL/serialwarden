@@ -141,8 +141,9 @@ test("a mostly-undecodable rx burst surfaces a baud suggestion in the settings p
   // invalid UTF-8 (continuation/lead bytes with no valid sequence around
   // them) — the same fixture shape
   // `crates/serialwardend/src/web/api.rs`'s own
-  // `compute_decode_health_suggests_a_different_baud_for_a_mostly_garbled_sample`
+  // `config_endpoint_surfaces_a_baud_suggestion_after_a_garbled_burst`
   // unit test uses, here driven through the real HTTP/WS pipeline instead.
+  // No history and no chip banner: issue #50's direction rule applies.
   const garbled = Buffer.concat([
     Buffer.from(Array.from({ length: 300 }, (_, i) => (0x80 + (i % 128)) & 0xff)),
     Buffer.from("\n"),
@@ -153,5 +154,147 @@ test("a mostly-undecodable rx burst surfaces a baud suggestion in the settings p
   const hint = page.getByTestId("decode-health-hint");
   await expect(hint).toBeVisible({ timeout: 10_000 });
   await expect(hint).toContainText("failed to decode");
+  await expect(hint).toHaveAttribute("data-basis", "direction");
+  await expect(page.getByTestId("baud-suggestion-explanation")).toContainText("next common rate up");
   await expect(page.getByTestId("use-suggested-baud")).toBeVisible();
+});
+
+// ---- Issue #50: the suggestion is inferred from recorded evidence ----
+
+/** The issue's reference data: an RTL8735B's normal-mode boot banner,
+ * then what its UART download mode looks like read at the boot rate — no
+ * line break anywhere in it, so not one assembled line. */
+const RTL_BOOT = ["voe   :RTL8735B_VOE_1.7.1.0", "Set H264 default HIGH profile", "[video_pre_init_procedure] START"];
+const DOWNLOAD_MODE = Buffer.from([
+  0xf7, 0x08, 0x32, 0x08, 0xc8, 0x86, 0x84, 0x08, 0x04, 0x85, 0xe6, 0xc4, 0x08, 0x08, 0x88, 0x8f, 0x08, 0x3e, 0x06,
+  0x81, 0xe6, 0xc4, 0x08, 0x08, 0x88, 0x8f, 0x08, 0x3f, 0x06, 0x87, 0xe6, 0xf4, 0x08,
+]);
+const REALTEK_SOURCE = "https://aiot.realmcu.com/en/latest/tools/image_tool/index.html";
+
+function downloadModeOps(n: number): InjectOp[] {
+  return Array.from({ length: n }, () => ({ kind: "rx", data_b64: DOWNLOAD_MODE.toString("base64") }));
+}
+
+async function injectRtlModeSwitch(): Promise<void> {
+  const boot: InjectOp[] = [];
+  for (let i = 0; i < 3; i++) {
+    for (const t of RTL_BOOT) boot.push({ kind: "rx", text: `${t}\r\n` });
+  }
+  await injectLog(daemon!, DEVICE_ID, [...boot, ...downloadModeOps(4)]);
+}
+
+async function currentBaud(): Promise<number> {
+  const res = await fetch(`${daemon!.url}/api/devices/${DEVICE_ID}/config`);
+  const body = (await res.json()) as { config: { baud: number } };
+  return body.config.baud;
+}
+
+/** Every `POST .../config` body the page sends — a trial sends at most two
+ * (the try and the revert), so at most two `config_change` records. */
+function recordConfigPosts(page: Page): Array<Record<string, unknown>> {
+  const posts: Array<Record<string, unknown>> = [];
+  page.on("request", (req) => {
+    if (req.method() === "POST" && new URL(req.url()).pathname === `/api/devices/${DEVICE_ID}/config`) {
+      posts.push(req.postDataJSON() as Record<string, unknown>);
+    }
+  });
+  return posts;
+}
+
+test("a recorded chip banner turns the suggestion into that chip's rate, with its source", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  await injectRtlModeSwitch();
+
+  await page.getByTestId("config-chip").click();
+  const hint = page.getByTestId("decode-health-hint");
+  await expect(hint).toBeVisible({ timeout: 10_000 });
+  await expect(hint).toHaveAttribute("data-basis", "fingerprint");
+  await expect(page.getByTestId("use-suggested-baud")).toHaveText("Try 1500000");
+  const explanation = page.getByTestId("baud-suggestion-explanation");
+  await expect(explanation).toContainText("RTL8735B");
+  await expect(explanation).toContainText("switched modes");
+  const source = page.getByTestId("baud-suggestion-source");
+  await expect(source).toHaveAttribute("href", REALTEK_SOURCE);
+  await expect(source).toHaveAttribute("target", "_blank");
+});
+
+test("trying a suggested baud that doesn't decode better switches back on its own", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  const original = await currentBaud();
+  await injectRtlModeSwitch();
+  const posts = recordConfigPosts(page);
+
+  await page.getByTestId("config-chip").click();
+  await page.getByTestId("use-suggested-baud").click();
+  await expect(page.getByTestId("baud-trial-status")).toHaveAttribute("data-state", "running");
+  await expect.poll(currentBaud, { timeout: 10_000 }).toBe(1_500_000);
+  // Still garbage at the new rate, and plenty of it to judge by.
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(20));
+
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "reverted", { timeout: 15_000 });
+  await expect(status).toContainText("didn't help");
+  await expect(status).toContainText(`switched back to ${original}`);
+  expect(await currentBaud()).toBe(original);
+  // Exactly the two real changes: the try and the revert.
+  expect(posts).toEqual([{ baud: 1_500_000 }, { baud: original }]);
+});
+
+test("the on-screen baud warning states its basis, even for binary with no complete line", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  // Binary only, no line break at all: the log view has no line item to
+  // time "recent" by, so the banner has to go by the daemon's sample time.
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(4));
+  await page.reload();
+  const banner = page.getByTestId("baud-warning");
+  await expect(banner).toBeVisible({ timeout: 10_000 });
+  await expect(banner).toHaveAttribute("data-basis", "direction");
+  await expect(page.getByTestId("baud-warning-apply")).toHaveText("Try 19200");
+
+  // Once a chip banner is on record, the warning names it and its source.
+  await injectLog(daemon!, DEVICE_ID, [{ kind: "rx", text: `${RTL_BOOT[0]}\r\n` }, ...downloadModeOps(4)]);
+  await page.reload();
+  await expect(banner).toHaveAttribute("data-basis", "fingerprint", { timeout: 10_000 });
+  await expect(page.getByTestId("baud-warning-basis")).toContainText("RTL8735B");
+  await expect(page.getByTestId("baud-warning-source")).toHaveAttribute("href", REALTEK_SOURCE);
+  await expect(page.getByTestId("baud-warning-apply")).toHaveText("Try 1500000");
+});
+
+test("a trial that hears nothing at the new rate switches back when its window ends", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  const original = await currentBaud();
+  await injectRtlModeSwitch();
+  const posts = recordConfigPosts(page);
+
+  await page.getByTestId("config-chip").click();
+  await page.getByTestId("use-suggested-baud").click();
+
+  // Silence is not an improvement: after the full measuring window the
+  // trial reverts and says it had nothing to judge.
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "reverted", { timeout: 15_000 });
+  await expect(status).toContainText("Nothing to judge arrived at 1500000");
+  expect(await currentBaud()).toBe(original);
+  expect(posts).toEqual([{ baud: 1_500_000 }, { baud: original }]);
+});
+
+test("trying a suggested baud that decodes keeps it", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  await injectRtlModeSwitch();
+  const posts = recordConfigPosts(page);
+
+  await page.getByTestId("config-chip").click();
+  await page.getByTestId("use-suggested-baud").click();
+  await expect.poll(currentBaud, { timeout: 10_000 }).toBe(1_500_000);
+  await injectLog(
+    daemon!,
+    DEVICE_ID,
+    rxLines(Array.from({ length: 6 }, (_, i) => `[ucfg] download ack ${i}, flash write ok`)),
+  );
+
+  const status = page.getByTestId("baud-trial-status");
+  await expect(status).toHaveAttribute("data-state", "kept", { timeout: 15_000 });
+  await expect(status).toContainText("Kept 1500000");
+  expect(await currentBaud()).toBe(1_500_000);
+  expect(posts).toEqual([{ baud: 1_500_000 }]);
 });

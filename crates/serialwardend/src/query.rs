@@ -425,6 +425,25 @@ impl Partial {
     }
 }
 
+/// How many of the newest raw `rx` bytes [`DeviceQueryState`] keeps
+/// verbatim, chunk by chunk, for [`DeviceQueryState::recent_rx`]. Issue #50:
+/// the decode-health check used to sample assembled *lines*, so a device
+/// whose output had stopped being text at all (a bootloader's download
+/// protocol rarely contains a `\n`) produced no lines and therefore no
+/// suggestion — exactly the case that check exists for. Raw chunks include
+/// whatever is still sitting in the partial-line buffer, and keep every
+/// byte (line assembly strips terminators, which binary-protocol framing
+/// detection needs to see).
+pub const RECENT_RX_BYTES: usize = 8 * 1024;
+
+/// One raw `rx` record's bytes, as retained by [`DeviceQueryState::recent_rx`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentRxChunk {
+    pub seq: u64,
+    pub t_wall: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Result of a `tail`/`read_since`-shaped query.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QueryPage {
@@ -563,6 +582,9 @@ pub struct DeviceQueryState {
     lines: Mutex<Vec<AssembledLine>>,
     events: Mutex<Vec<OobRecord>>,
     partial: Mutex<Partial>,
+    /// The newest raw `rx` chunks, bounded to roughly [`RECENT_RX_BYTES`] —
+    /// see that constant's docs.
+    recent_rx: Mutex<std::collections::VecDeque<RecentRxChunk>>,
     /// Lowest seq still represented here — the floor below which
     /// `read_since` must report [`QueryError::DataAgedOut`] rather than
     /// silently returning nothing (which would be indistinguishable from
@@ -597,6 +619,7 @@ impl DeviceQueryState {
             lines: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
             partial: Mutex::new(Partial::new(mode)),
+            recent_rx: Mutex::new(std::collections::VecDeque::new()),
             oldest_seq: Mutex::new(None),
             recorder_cursor: Mutex::new(0),
             notify: tokio::sync::Notify::new(),
@@ -615,6 +638,29 @@ impl DeviceQueryState {
     /// push loop — see [`Self::drain_since`].
     pub fn event_count(&self) -> usize {
         self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// The newest raw `rx` chunks (oldest first) whose `seq` is greater
+    /// than `after_seq` (all retained chunks when `None`), at most
+    /// [`RECENT_RX_BYTES`] of them in total — see that constant's docs for
+    /// why this exists alongside the assembled lines.
+    pub fn recent_rx(&self, after_seq: Option<u64>) -> Vec<RecentRxChunk> {
+        let recent_rx = self.recent_rx.lock().unwrap_or_else(|e| e.into_inner());
+        recent_rx
+            .iter()
+            .filter(|c| after_seq.is_none_or(|s| c.seq > s))
+            .cloned()
+            .collect()
+    }
+
+    /// Run `f` over every assembled line currently held, oldest first,
+    /// without cloning them — for read-only scans (issue #50's baud
+    /// inference walks back through the history for chip fingerprints and
+    /// per-baud readability). `f` runs with the lines lock held, so it must
+    /// be quick and must not call back into this state.
+    pub fn with_lines<R>(&self, f: impl FnOnce(&[AssembledLine]) -> R) -> R {
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        f(&lines)
     }
 
     /// Pull everything new from `recorder` since the last call and fold it
@@ -696,6 +742,7 @@ impl DeviceQueryState {
             let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
             let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
             let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+            let mut recent_rx = self.recent_rx.lock().unwrap_or_else(|e| e.into_inner());
 
             for record in &page.records {
                 match record {
@@ -714,6 +761,7 @@ impl DeviceQueryState {
                             // stance on unparseable stored bytes.
                             continue;
                         };
+                        push_recent_rx(&mut recent_rx, *seq, t_wall, &bytes);
                         for &b in &bytes {
                             for (raw, capped) in partial.push(b) {
                                 let text = String::from_utf8_lossy(&raw).into_owned();
@@ -1209,6 +1257,36 @@ fn kind_str(kind: Kind) -> &'static str {
         Kind::Tx => "tx",
         Kind::Event => "event",
         Kind::Gate => "gate",
+    }
+}
+
+/// Append one `rx` chunk to [`DeviceQueryState`]'s recent-bytes window and
+/// drop whole chunks from the front while the rest still covers
+/// [`RECENT_RX_BYTES`]. A single chunk larger than the window is kept
+/// trimmed to its newest bytes, so the window never holds more than
+/// roughly twice its nominal size.
+fn push_recent_rx(
+    recent_rx: &mut std::collections::VecDeque<RecentRxChunk>,
+    seq: u64,
+    t_wall: &str,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let keep_from = bytes.len().saturating_sub(RECENT_RX_BYTES);
+    recent_rx.push_back(RecentRxChunk {
+        seq,
+        t_wall: t_wall.to_string(),
+        bytes: bytes[keep_from..].to_vec(),
+    });
+    let mut total: usize = recent_rx.iter().map(|c| c.bytes.len()).sum();
+    while let Some(front) = recent_rx.front() {
+        if total - front.bytes.len() < RECENT_RX_BYTES {
+            break;
+        }
+        total -= front.bytes.len();
+        recent_rx.pop_front();
     }
 }
 
@@ -2220,5 +2298,29 @@ mod tests {
         let ranged = state.query_events(&[], Some(1), Some(1));
         assert_eq!(ranged.len(), 1);
         assert_eq!(ranged[0].name.as_deref(), Some("disconnect"));
+    }
+
+    /// Issue #50: bytes that never complete a line (a binary protocol with
+    /// no `\n`) still reach `recent_rx`, and the window stays bounded.
+    #[test]
+    fn recent_rx_keeps_unterminated_bytes_and_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+        recorder.append_rx(&[0xf7, 0x08, 0x32]).unwrap();
+        state.ingest(&recorder);
+        assert_eq!(state.line_count(), 0);
+        let recent = state.recent_rx(None);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].bytes, vec![0xf7, 0x08, 0x32]);
+        assert!(state.recent_rx(Some(recent[0].seq)).is_empty());
+
+        for _ in 0..100 {
+            recorder.append_rx(&[0x88; 1000]).unwrap();
+        }
+        state.ingest(&recorder);
+        let total: usize = state.recent_rx(None).iter().map(|c| c.bytes.len()).sum();
+        assert!(total >= RECENT_RX_BYTES, "{total}");
+        assert!(total < RECENT_RX_BYTES + 1000, "{total}");
     }
 }

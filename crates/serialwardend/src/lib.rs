@@ -13,6 +13,7 @@
 //! device I/O, no recording, no protocol handling. See the module docs for
 //! which later task fills each one in.
 
+pub mod baud_hint;
 pub mod device_profile;
 pub mod error_counts;
 pub mod export;

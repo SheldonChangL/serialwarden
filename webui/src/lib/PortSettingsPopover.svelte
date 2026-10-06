@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { fetchDeviceConfig, setControlLines, setDeviceConfig, type DeviceConfig } from "./logStream";
+  import { describeOutcome, runBaudTrial, trialRunning, type TrialOutcome } from "./baudTrial";
 
   interface Props {
     deviceId: string;
@@ -98,6 +99,7 @@
     try {
       const full = await fetchDeviceConfig(deviceId);
       loadFromConfig(full.config);
+      appliedBaud = Number(full.config.baud ?? 9600);
       decodeHealth = full.decode_health;
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
@@ -113,7 +115,7 @@
 
   // Refetch every time the popover opens, not just once on mount — the
   // decode-health hint in particular needs to reflect whatever has arrived
-  // on the device *since* it was last opened (see `compute_decode_health`'s
+  // on the device *since* it was last opened (see `crates/serialwardend/src/baud_hint.rs`'s
   // doc comment: a short recent window, not a running-forever average).
   let wasOpen = false;
   $effect(() => {
@@ -128,8 +130,35 @@
     if (value !== "custom") baud = Number(value);
   }
 
-  function useSuggestedBaud(): void {
-    if (decodeHealth?.suggested_baud) baud = decodeHealth.suggested_baud;
+  /** Issue #50: "Try" is an experiment, not just a value copied into the
+   * field — see `baudTrial.ts`. It applies the suggested rate, measures
+   * what arrives at it, and keeps it only if that measurably decodes
+   * better; otherwise it switches back and says so. */
+  let trying = $state<number | null>(null);
+  /** The rate actually applied on the port (not the possibly-edited form
+   * field) — what a failed trial switches back to. */
+  let appliedBaud = $state(9600);
+  let trialOutcome = $state<TrialOutcome | null>(null);
+
+  async function trySuggestedBaud(): Promise<void> {
+    const suggested = decodeHealth?.suggested_baud;
+    if (!suggested || trying !== null || trialRunning(deviceId)) return;
+    const previous = appliedBaud;
+    const baseline = {
+      checked_bytes: decodeHealth?.checked_bytes ?? 0,
+      undecodable_ratio: decodeHealth?.undecodable_ratio ?? 0,
+    };
+    trying = suggested;
+    trialOutcome = null;
+    trialOutcome = await runBaudTrial(deviceId, previous, suggested, baseline, {
+      fetchConfig: fetchDeviceConfig,
+      setConfig: setDeviceConfig,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      now: () => Date.now(),
+    });
+    trying = null;
+    onApplied();
+    await refresh();
   }
 
   async function applyConfig(): Promise<void> {
@@ -219,13 +248,38 @@
           bind:value={baud}
         />
       </div>
-      {#if decodeHealth?.suggested_baud}
-        <p class="hint" data-testid="decode-health-hint">
+      {#if decodeHealth?.suggested_baud && trying === null}
+        <p class="hint" data-testid="decode-health-hint" data-basis={decodeHealth.suggestion?.basis}>
           &#9432; {Math.round(decodeHealth.undecodable_ratio * 100)}% of recent output failed to decode — baud may
           be wrong.
-          <button type="button" data-testid="use-suggested-baud" onclick={useSuggestedBaud}>
+          {#if decodeHealth.suggestion}
+            <span data-testid="baud-suggestion-explanation">{decodeHealth.suggestion.explanation}</span>
+            {#if decodeHealth.suggestion.fingerprint}
+              <a
+                data-testid="baud-suggestion-source"
+                href={decodeHealth.suggestion.fingerprint.source_url}
+                target="_blank"
+                rel="noopener noreferrer">Source</a
+              >
+            {/if}
+          {/if}
+          <button
+            type="button"
+            data-testid="use-suggested-baud"
+            title="Switches to this rate, measures for a few seconds, and switches back if it doesn't decode better"
+            onclick={trySuggestedBaud}
+          >
             Try {decodeHealth.suggested_baud}
           </button>
+        </p>
+      {/if}
+      {#if trying !== null}
+        <p class="hint" data-testid="baud-trial-status" data-state="running">
+          Trying {trying} — measuring what arrives at it…
+        </p>
+      {:else if trialOutcome}
+        <p class="hint" data-testid="baud-trial-status" data-state={trialOutcome.kind}>
+          {describeOutcome(trialOutcome)}
         </p>
       {/if}
     </section>
@@ -377,6 +431,10 @@
   .hint {
     color: var(--text-dim);
     margin: 0;
+  }
+  .hint a {
+    color: inherit;
+    margin-left: 0.2rem;
   }
   .hint button {
     font: inherit;
