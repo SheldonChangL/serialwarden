@@ -35,6 +35,7 @@
   import { LiveLogBuffer, type LogItem, type TimestampMode } from "./liveLog";
   import {
     LogStream,
+    configChipText,
     fetchDeviceConfig,
     setDeviceConfig,
     type DeviceConfig,
@@ -544,8 +545,10 @@
     return itemSeqForDisplay(buffer.items[buffer.items.length - 1]).toLocaleString();
   });
 
-  const configLabel = $derived(
-    formatConfig(deviceConfig?.config as Parameters<typeof formatConfig>[0]),
+  /** What the port runs, and the saved settings only when the port isn't
+   * running them — see `configChipText`. */
+  const configChip = $derived(
+    configChipText(deviceConfig, (cfg) => formatConfig(cfg as Parameters<typeof formatConfig>[0])),
   );
 
   /** Dismissing is per-view and deliberately not persisted: a board that
@@ -663,12 +666,14 @@
       <button
         type="button"
         class="config-chip tnum"
+        class:not-applied={configChip.notApplied}
         data-testid="config-chip"
+        data-applied={deviceConfig?.applied ?? null}
         bind:this={configChipEl}
-        title="Port settings"
+        title={configChip.title}
         onclick={() => (popoverOpen = !popoverOpen)}
       >
-        {configLabel}
+        {configChip.label}
       </button>
       <PortSettingsPopover
         {deviceId}
@@ -933,6 +938,10 @@
   }
   .config-chip:hover {
     border-color: var(--border-strong);
+    color: var(--text);
+  }
+  .config-chip.not-applied {
+    border-color: var(--dot-closed);
     color: var(--text);
   }
 

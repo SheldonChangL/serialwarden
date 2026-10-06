@@ -547,3 +547,61 @@ test("a trial whose rate the port refuses stops at once and says why", async ({ 
   expect(health.suggested_baud).toBe(19_200);
 });
 
+
+// ---- The chip and the banner say when the port refused a rate ----
+
+test("the config chip shows what the port runs, not a saved rate it refused", async ({ page }) => {
+  const portError = "Invalid argument (os error 22)";
+  daemon = await startDaemon({ testDeviceId: DEVICE_ID, applyError: portError });
+  await page.goto(daemon.url);
+  await expect(page.getByTestId("connection-dot")).toHaveAttribute("data-state", "open", { timeout: 10_000 });
+  const chip = page.getByTestId("config-chip");
+  await expect(chip).toHaveText("9600 8N1", { timeout: 10_000 });
+  await expect(chip).toHaveAttribute("data-applied", "true");
+
+  await chip.click();
+  await page.getByTestId("baud-input").fill("74880");
+  await page.getByTestId("apply-config").click();
+  await expect(page.getByTestId("config-apply-error")).toBeVisible({ timeout: 10_000 });
+
+  // The port is still on 9600; 74880 is only saved.
+  await expect(chip).toHaveText("9600 8N1 (saved: 74880 8N1, not applied)", { timeout: 10_000 });
+  await expect(chip).toHaveAttribute("data-applied", "false");
+  await expect(chip).toHaveAttribute("title", new RegExp(portError.replace(/[()]/g, "\\$&")));
+
+  // The same state, from the API every client reads.
+  const res = await fetch(`${daemon.url}/api/devices/${DEVICE_ID}/config`);
+  const body = (await res.json()) as {
+    config: { baud: number };
+    applied: boolean;
+    apply: string;
+    apply_error?: string;
+    last_applied?: { baud: number };
+  };
+  expect(body.config.baud).toBe(74_880);
+  expect(body.applied).toBe(false);
+  expect(body.apply).toBe("failed");
+  expect(body.apply_error).toBe(portError);
+  expect(body.last_applied?.baud).toBe(9600);
+});
+
+test("a trial started from the on-screen baud warning reports a refused rate there", async ({ page }) => {
+  const portError = "Invalid argument (os error 22)";
+  daemon = await startDaemon({ testDeviceId: DEVICE_ID, applyError: portError });
+  await page.goto(daemon.url);
+  await expect(page.getByTestId("connection-dot")).toHaveAttribute("data-state", "open", { timeout: 10_000 });
+  await injectLog(daemon!, DEVICE_ID, downloadModeOps(4));
+  await page.reload();
+  await expect(page.getByTestId("baud-warning-apply")).toHaveText("Try 19200", { timeout: 10_000 });
+
+  await page.getByTestId("baud-warning-apply").click();
+  const banner = page.getByTestId("baud-trial-banner");
+  await expect(banner).toHaveAttribute("data-state", "not_applied", { timeout: 10_000 });
+  await expect(banner).toContainText(`Couldn't apply 19200: ${portError}`);
+  // The saved rate went back to 9600, but on this port putting it back is a
+  // live apply too, and it failed as well: the chip doesn't claim 9600 is
+  // simply running.
+  await expect(page.getByTestId("config-chip")).toHaveText("9600 8N1 (last apply failed)", {
+    timeout: 10_000,
+  });
+});

@@ -1475,6 +1475,54 @@ async fn set_config_reply_reports_whether_the_port_applied_it() {
     assert_eq!(applied, vec![json!(true), json!(false)]);
 }
 
+/// `get_config` returns the saved `config` and says whether the port runs
+/// it: after a refused change, `applied: false`, the error, and what the
+/// port last accepted.
+#[tokio::test]
+async fn get_config_reports_whether_the_port_runs_the_saved_config() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) =
+        start_test_daemon(Arc::clone(&backend) as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "operator", "human").await;
+
+    c.send(json!({"id": 1, "op": "get_config", "device": "dev"}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["applied"], true, "{reply}");
+    assert_eq!(reply["apply"], "live", "{reply}");
+    assert!(reply.get("last_applied").is_none(), "{reply}");
+
+    backend.fail_live_apply(Some("Invalid argument (os error 22)".to_string()));
+    c.send(json!({"id": 2, "op": "set_config", "device": "dev", "baud": 74880}))
+        .await;
+    assert_eq!(c.recv().await["applied"], false);
+
+    c.send(json!({"id": 3, "op": "get_config", "device": "dev"}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["config"]["baud"], 74880, "saved: {reply}");
+    let state: warden_proto::PortApplyState =
+        serde_json::from_value(reply.clone()).expect("reply carries PortApplyState");
+    assert!(!state.applied);
+    assert_eq!(state.apply, warden_proto::ConfigApply::Failed);
+    assert_eq!(
+        state.apply_error.as_deref(),
+        Some("Invalid argument (os error 22)")
+    );
+    assert_eq!(state.last_applied.unwrap()["baud"], 9600);
+
+    backend.set_connected(&DeviceId("dev".to_string()), false);
+    c.send(json!({"id": 4, "op": "get_config", "device": "dev"}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["apply"], "not_connected", "{reply}");
+    assert!(reply.get("apply_error").is_none(), "{reply}");
+}
+
 /// `config_change` events in a `read_since` reply, minus the
 /// `system:connect` profile application every connect records.
 fn client_config_changes(read_reply: &Value) -> Vec<Value> {

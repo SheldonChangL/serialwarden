@@ -61,6 +61,30 @@ impl ConfigApplyOutcome {
     }
 }
 
+/// Whether the open port is running the saved configuration: the fields a
+/// `get_config` reply (UDS, web, MCP) carries next to `config`, which is
+/// always the *saved* one. Without these a client showing `config` shows
+/// what the daemon will apply next time, not necessarily what the port runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortApplyState {
+    /// The port is open and known to be running the saved `config`.
+    pub applied: bool,
+    /// `live` (running the saved config), `not_connected` (no open port),
+    /// or `failed` (the last application to the open port failed, so it is
+    /// not known to run the saved config). Never `already_applied`.
+    pub apply: ConfigApply,
+    /// The error from the last failed application, when `apply` is `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_error: Option<String>,
+    /// When `apply` is `failed`: the last configuration the open port
+    /// accepted, if any (a port config object, same shape as `config`; it
+    /// can equal `config` when a later apply of it failed). After a failed
+    /// change this is what the port was left on — the driver may have taken
+    /// part of the failed change, so "last accepted", not a read-back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_applied: Option<serde_json::Value>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

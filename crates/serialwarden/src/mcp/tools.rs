@@ -600,6 +600,15 @@ impl ToolRegistry {
             "config": reply["config"],
             "error_counts": reply["error_counts"],
         });
+        // Whether the port runs that saved `config`; absent from a daemon
+        // that predates these fields.
+        if let Value::Object(fields) = &mut result {
+            for key in ["applied", "apply", "apply_error", "last_applied"] {
+                if let Some(v) = reply.get(key) {
+                    fields.insert(key.to_string(), v.clone());
+                }
+            }
+        }
         cap_device_events(device, events).attach_to(&mut result);
         Ok(result)
     }

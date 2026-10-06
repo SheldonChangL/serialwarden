@@ -283,12 +283,18 @@ async fn get_config(
         }
         None => baud_hint::DecodeHealth::default(),
     };
-    Json(json!({
+    let mut body = json!({
         "config": config,
         "error_counts": error_counts,
         "decode_health": decode_health,
-    }))
-    .into_response()
+    });
+    // `config` is the saved configuration; these say whether the port is
+    // running it (`warden_proto::PortApplyState`) — the config chip shows
+    // what the port runs, not just what was saved.
+    if let (Value::Object(body), Ok(state)) = (&mut body, shared.backend.port_state(&dev)) {
+        body.extend(crate::device_profile::port_state_fields(&state));
+    }
+    Json(body).into_response()
 }
 
 /// `POST /api/devices/:id/config` (T5.3, issue #20): the port settings

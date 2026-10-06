@@ -457,6 +457,21 @@ async fn config_cli_write_the_port_rejects_says_not_applied_and_exits_nonzero() 
     // open applies.
     assert!(text.contains("baud=74880"), "text: {text}");
     assert!(stderr.contains("not in effect"), "stderr: {stderr}");
+
+    // A later plain read says so too, rather than just printing the saved
+    // config as if the port ran it.
+    let output = cli(&daemon.socket_path, &["config", "dev"])
+        .output()
+        .await
+        .expect("run config (read-back)");
+    assert!(output.status.success(), "stderr: {}", stderr_text(&output));
+    let text = stdout_text(&output);
+    assert!(text.contains("baud=74880"), "text: {text}");
+    assert!(
+        text.contains("port: NOT running the saved config"),
+        "text: {text}"
+    );
+    assert!(text.contains("last accepted baud=9600"), "text: {text}");
 }
 
 /// Setting what is already in effect says so instead of claiming an update.

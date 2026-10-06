@@ -87,9 +87,56 @@ export interface DecodeHealth {
 }
 
 export interface DeviceConfig {
+  /** The *saved* configuration — what the next open applies. */
   config: Record<string, unknown>;
   error_counts?: { status: "available" | "unavailable"; framing?: number; overrun?: number; parity?: number };
   decode_health?: DecodeHealth;
+  /** Whether the open port is running `config` (`warden_proto::PortApplyState`).
+   * Absent from a daemon that predates these fields. */
+  applied?: boolean;
+  apply?: "live" | "not_connected" | "failed";
+  apply_error?: string;
+  /** The last config the open port accepted, when it differs from `config`. */
+  last_applied?: Record<string, unknown>;
+}
+
+/** The config chip's text and hover title: what the port runs, and the saved
+ * settings only when they differ from it. A chip showing just the saved
+ * config claimed a baud the port had refused (issue #73's known gap). */
+export function configChipText(
+  dc: DeviceConfig | null,
+  format: (cfg: Record<string, unknown> | null | undefined) => string,
+): { label: string; title: string; notApplied: boolean } {
+  const saved = format(dc?.config);
+  if (dc?.apply === "failed") {
+    const why = dc.apply_error ? `applying it failed: ${dc.apply_error}` : "the port isn't known to run it";
+    if (dc.last_applied && JSON.stringify(dc.last_applied) === JSON.stringify(dc.config)) {
+      // It accepted these settings before; a later apply (of them or of
+      // something else) failed, so the driver may have changed part of it.
+      return {
+        label: `${saved} (last apply failed)`,
+        title: `The port last accepted ${saved}, but a later apply failed${dc.apply_error ? `: ${dc.apply_error}` : ""}. Its settings may have partly changed until the next reconnect.`,
+        notApplied: true,
+      };
+    }
+    if (dc.last_applied) {
+      const running = format(dc.last_applied);
+      return {
+        label: `${running} (saved: ${saved}, not applied)`,
+        title: `The port last accepted ${running}. Saved ${saved}, but ${why}. It applies on the next reconnect.`,
+        notApplied: true,
+      };
+    }
+    return {
+      label: `${saved} (not applied)`,
+      title: `Saved ${saved}, but ${why}. It applies on the next reconnect.`,
+      notApplied: true,
+    };
+  }
+  if (dc?.apply === "not_connected") {
+    return { label: saved, title: `Port not open; ${saved} applies when it opens. Port settings`, notApplied: false };
+  }
+  return { label: saved, title: "Port settings", notApplied: false };
 }
 
 export async function fetchDeviceConfig(deviceId: string): Promise<DeviceConfig> {

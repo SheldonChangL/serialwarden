@@ -322,6 +322,27 @@ fn print_config(out: &mut impl io::Write, device: &str, reply: &Value) -> io::Re
          flow={flow} open_control_lines={open_lines_desc}"
     )?;
 
+    // The line above is the *saved* config; say when the port isn't running
+    // it. Absent from a daemon that predates these fields: print nothing.
+    match reply["apply"].as_str() {
+        Some("failed") => {
+            let error = reply["apply_error"].as_str().unwrap_or("no error given");
+            let last = match reply["last_applied"]["baud"].as_u64() {
+                Some(baud) => format!("; the port last accepted baud={baud}"),
+                None => String::new(),
+            };
+            writeln!(
+                out,
+                "port: NOT running the saved config (its last apply failed: {error}){last}"
+            )?;
+        }
+        Some("not_connected") => writeln!(
+            out,
+            "port: not open; the saved config applies when it next opens"
+        )?,
+        _ => {}
+    }
+
     let error_counts = &reply["error_counts"];
     match error_counts["status"].as_str() {
         Some("available") => writeln!(
