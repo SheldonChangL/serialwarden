@@ -32,16 +32,58 @@ async function fetchTail(deviceId: string, n?: number): Promise<PresentedPageJso
   return (await res.json()) as PresentedPageJson;
 }
 
-/** `decode_health`'s wire shape (`TASKS.md` T5.3, issue #20 —
- * `crates/serialwardend/src/web/api.rs`'s `DecodeHealth`): whether recent
- * output looks like it's arriving at the wrong baud, and what to try
- * instead. `suggested_baud` is only ever present once both a minimum sample
- * size and an undecodable-ratio threshold are met — see that struct's doc
- * comment for the exact numbers and the reasoning against them. */
+/** Where a baud suggestion comes from (issue #50 —
+ * `crates/serialwardend/src/baud_hint.rs`'s `Basis`): the device's own
+ * history at other rates, a chip banner in its log, the direction
+ * heuristic for output with no text at all, or — with no evidence — just
+ * the next common rate. */
+export type SuggestionBasis = "history" | "fingerprint" | "direction" | "common";
+
+export interface BaudSuggestion {
+  baud: number;
+  basis: SuggestionBasis;
+  /** The current rate produced readable text earlier and nothing arriving
+   * now is text: "the device appears to have switched modes". */
+  mode_switch: boolean;
+  readable_bauds: number[];
+  /** Rates tried in this connection without a readable line — not offered
+   * again until the device reconnects. */
+  tried_bauds?: number[];
+  /** The next candidates by the same rules, in order. */
+  alternatives?: number[];
+  fingerprint: {
+    pattern: string;
+    platform: string;
+    source_url: string;
+    also_see?: string[];
+    reason: string;
+  } | null;
+  /** Plain sentences stating the basis — shown as-is. */
+  explanation: string;
+}
+
+/** `decode_health`'s wire shape (`TASKS.md` T5.3, issue #20; reworked by
+ * issue #50 — `crates/serialwardend/src/baud_hint.rs`'s `DecodeHealth`):
+ * how much of the output recorded since the baud last changed isn't text,
+ * and, past a threshold, what to try instead and why. */
 export interface DecodeHealth {
   checked_bytes: number;
   undecodable_ratio: number;
+  text_lines?: number;
+  /** `"slip"` when the sample is structured binary protocol traffic — no
+   * suggestion is made for it. */
+  binary_protocol?: string | null;
+  /** When the newest sampled bytes were recorded — set even when they
+   * never formed a complete line. */
+  newest_sample_t_wall?: string | null;
+  /** The port's state as recorded events tell it — a baud trial uses it to
+   * tell "went quiet" from "went away". */
+  port?: "unknown" | "open" | "disconnected" | "leased";
+  /** `connect` events seen in this connection-scoped evidence; a change
+   * means the device reconnected. */
+  connects?: number;
   suggested_baud: number | null;
+  suggestion?: BaudSuggestion | null;
 }
 
 export interface DeviceConfig {

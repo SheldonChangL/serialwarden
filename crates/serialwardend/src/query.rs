@@ -563,6 +563,10 @@ pub struct DeviceQueryState {
     lines: Mutex<Vec<AssembledLine>>,
     events: Mutex<Vec<OobRecord>>,
     partial: Mutex<Partial>,
+    /// Issue #50's baud evidence (recent raw bytes, per-rate segments, chip
+    /// fingerprints), folded in incrementally by [`Self::ingest`] so a
+    /// `decode_health` query never rescans the history.
+    evidence: Mutex<crate::baud_hint::EvidenceTracker>,
     /// Lowest seq still represented here — the floor below which
     /// `read_since` must report [`QueryError::DataAgedOut`] rather than
     /// silently returning nothing (which would be indistinguishable from
@@ -597,6 +601,7 @@ impl DeviceQueryState {
             lines: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
             partial: Mutex::new(Partial::new(mode)),
+            evidence: Mutex::new(crate::baud_hint::EvidenceTracker::default()),
             oldest_seq: Mutex::new(None),
             recorder_cursor: Mutex::new(0),
             notify: tokio::sync::Notify::new(),
@@ -615,6 +620,23 @@ impl DeviceQueryState {
     /// push loop — see [`Self::drain_since`].
     pub fn event_count(&self) -> usize {
         self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// The newest raw `rx` chunks the baud evidence holds, oldest first —
+    /// see [`crate::baud_hint::RECENT_RX_BYTES`].
+    pub fn recent_rx(&self) -> Vec<crate::baud_hint::RecentRxChunk> {
+        let evidence = self.evidence.lock().unwrap_or_else(|e| e.into_inner());
+        evidence.recent().to_vec()
+    }
+
+    /// Decode health and baud suggestion for this device, given the rate
+    /// its saved configuration names (issue #50) — see
+    /// [`crate::baud_hint::infer`]. Works off the evidence [`Self::ingest`]
+    /// has already folded in, so it costs a few KiB of work regardless of
+    /// how much history the device has.
+    pub fn decode_health(&self, configured_baud: u32) -> crate::baud_hint::DecodeHealth {
+        let evidence = self.evidence.lock().unwrap_or_else(|e| e.into_inner());
+        crate::baud_hint::infer(configured_baud, &evidence)
     }
 
     /// Pull everything new from `recorder` since the last call and fold it
@@ -696,6 +718,7 @@ impl DeviceQueryState {
             let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
             let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
             let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+            let mut evidence = self.evidence.lock().unwrap_or_else(|e| e.into_inner());
 
             for record in &page.records {
                 match record {
@@ -714,17 +737,20 @@ impl DeviceQueryState {
                             // stance on unparseable stored bytes.
                             continue;
                         };
+                        evidence.on_rx(*seq, *t_mono, t_wall, &bytes);
                         for &b in &bytes {
                             for (raw, capped) in partial.push(b) {
                                 let text = String::from_utf8_lossy(&raw).into_owned();
-                                lines.push(AssembledLine {
+                                let line = AssembledLine {
                                     raw,
                                     text,
                                     seq: *seq,
                                     t_mono: *t_mono,
                                     t_wall: t_wall.clone(),
                                     capped,
-                                });
+                                };
+                                evidence.on_line(&line);
+                                lines.push(line);
                                 added = true;
                             }
                         }
@@ -736,6 +762,7 @@ impl DeviceQueryState {
                         event,
                         extra,
                     } => {
+                        evidence.on_event(*seq, event, extra);
                         events.push(OobRecord {
                             seq: *seq,
                             t_mono: *t_mono,
@@ -2220,5 +2247,29 @@ mod tests {
         let ranged = state.query_events(&[], Some(1), Some(1));
         assert_eq!(ranged.len(), 1);
         assert_eq!(ranged[0].name.as_deref(), Some("disconnect"));
+    }
+
+    /// Issue #50: bytes that never complete a line (a binary protocol with
+    /// no `\n`) still reach `recent_rx`, and the window stays bounded.
+    #[test]
+    fn recent_rx_keeps_unterminated_bytes_and_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+        recorder.append_rx(&[0xf7, 0x08, 0x32]).unwrap();
+        state.ingest(&recorder);
+        assert_eq!(state.line_count(), 0);
+        let recent = state.recent_rx();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].bytes, vec![0xf7, 0x08, 0x32]);
+
+        for _ in 0..100 {
+            recorder.append_rx(&[0x88; 1000]).unwrap();
+        }
+        state.ingest(&recorder);
+        let total: usize = state.recent_rx().iter().map(|c| c.bytes.len()).sum();
+        let window = crate::baud_hint::RECENT_RX_BYTES;
+        assert!(total >= window, "{total}");
+        assert!(total < window + 1000, "{total}");
     }
 }

@@ -7,6 +7,8 @@
     setDeviceConfig,
     type DeviceConfig,
   } from "./logStream";
+  import { browserDeps, planFromHealth, startTrial, subscribeTrial } from "./baudTrial";
+  import BaudTrialStatus from "./BaudTrialStatus.svelte";
 
   interface Props {
     deviceId: string;
@@ -122,7 +124,7 @@
 
   // Refetch every time the popover opens, not just once on mount — the
   // decode-health hint in particular needs to reflect whatever has arrived
-  // on the device *since* it was last opened (see `compute_decode_health`'s
+  // on the device *since* it was last opened (see `crates/serialwardend/src/baud_hint.rs`'s
   // doc comment: a short recent window, not a running-forever average).
   let wasOpen = false;
   $effect(() => {
@@ -137,8 +139,22 @@
     if (value !== "custom") baud = Number(value);
   }
 
-  function useSuggestedBaud(): void {
-    if (decodeHealth?.suggested_baud) baud = decodeHealth.suggested_baud;
+  /** Issue #50: "Try" is an experiment, not just a value copied into the
+   * field — see `baudTrial.ts` for what it measures, when it switches back,
+   * and when it can only say "unconfirmed". The trial's state is per
+   * device and shared with the on-screen warning. */
+  let trialRunning = $state(false);
+  $effect(() => subscribeTrial(deviceId, (v) => (trialRunning = v.running !== null)));
+
+  function trySuggestedBaud(): void {
+    const plan = decodeHealth ? planFromHealth(decodeHealth) : null;
+    if (plan === null || trialRunning) return;
+    void startTrial(deviceId, plan, browserDeps(fetchDeviceConfig, setDeviceConfig));
+  }
+
+  async function onTrialChanged(): Promise<void> {
+    onApplied();
+    await refresh();
   }
 
   async function applyConfig(): Promise<void> {
@@ -239,15 +255,37 @@
           bind:value={baud}
         />
       </div>
-      {#if decodeHealth?.suggested_baud}
-        <p class="hint" data-testid="decode-health-hint">
+      {#if decodeHealth?.suggested_baud && !trialRunning}
+        <p class="hint" data-testid="decode-health-hint" data-basis={decodeHealth.suggestion?.basis}>
           &#9432; {Math.round(decodeHealth.undecodable_ratio * 100)}% of recent output failed to decode — baud may
           be wrong.
-          <button type="button" data-testid="use-suggested-baud" onclick={useSuggestedBaud}>
+          {#if decodeHealth.suggestion}
+            <span data-testid="baud-suggestion-explanation">{decodeHealth.suggestion.explanation}</span>
+            {#if decodeHealth.suggestion.fingerprint}
+              <a
+                data-testid="baud-suggestion-source"
+                href={decodeHealth.suggestion.fingerprint.source_url}
+                target="_blank"
+                rel="noopener noreferrer">Source</a
+              >
+              {#each decodeHealth.suggestion.fingerprint.also_see ?? [] as url, i (url)}
+                <a data-testid="baud-suggestion-also-see" href={url} target="_blank" rel="noopener noreferrer"
+                  >See also{i > 0 ? ` ${i + 1}` : ""}</a
+                >
+              {/each}
+            {/if}
+          {/if}
+          <button
+            type="button"
+            data-testid="use-suggested-baud"
+            title="Switches to this rate and measures what arrives at it for a few seconds"
+            onclick={trySuggestedBaud}
+          >
             Try {decodeHealth.suggested_baud}
           </button>
         </p>
       {/if}
+      <BaudTrialStatus {deviceId} testid="baud-trial-status" class="hint trial" onChanged={onTrialChanged} />
     </section>
 
     <section class="group">
@@ -400,6 +438,27 @@
   .hint {
     color: var(--text-dim);
     margin: 0;
+  }
+  :global(.popover .trial) {
+    color: var(--text-dim);
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  :global(.popover .trial button) {
+    font: inherit;
+    border: 1px solid var(--border);
+    background: var(--surface-raised);
+    color: inherit;
+    border-radius: 0.3rem;
+    cursor: pointer;
+  }
+
+  .hint a {
+    color: inherit;
+    margin-left: 0.2rem;
   }
   .hint button {
     font: inherit;
