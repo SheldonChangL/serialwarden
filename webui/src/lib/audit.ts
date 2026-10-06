@@ -23,7 +23,13 @@ export interface AuditRow {
   [key: string]: unknown;
 }
 
-export async function fetchAudit(deviceId: string, sinceSeq?: number, untilSeq?: number): Promise<AuditRow[]> {
+export interface AuditPage {
+  rows: AuditRow[];
+  /** Older records the daemon left out; it returns only the newest ones. */
+  omitted: number;
+}
+
+export async function fetchAudit(deviceId: string, sinceSeq?: number, untilSeq?: number): Promise<AuditPage> {
   const params = new URLSearchParams();
   if (sinceSeq !== undefined) params.set("since_seq", String(sinceSeq));
   if (untilSeq !== undefined) params.set("until_seq", String(untilSeq));
@@ -32,8 +38,8 @@ export async function fetchAudit(deviceId: string, sinceSeq?: number, untilSeq?:
   if (!res.ok) {
     throw new Error(`GET /api/devices/${deviceId}/audit failed: ${res.status} ${res.statusText}`);
   }
-  const body = (await res.json()) as { audit: AuditRow[] };
-  return body.audit;
+  const body = (await res.json()) as { audit: AuditRow[]; omitted?: number };
+  return { rows: body.audit, omitted: body.omitted ?? 0 };
 }
 
 function decodeB64Length(value: unknown): number | null {

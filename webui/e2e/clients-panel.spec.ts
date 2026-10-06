@@ -99,6 +99,34 @@ test("clients panel keeps a finished lease listed after it ends", async ({ page 
   await expect(row.getByTestId("finished-lease-detail")).toContainText("esptool.py write_flash");
 });
 
+test("clients panel lists only recent finished leases and says how many it left out", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  // A bench that flashes all day accumulates lease_end records; the panel
+  // polls every two seconds and must not ship all of them every time.
+  await injectLog(
+    daemon!,
+    DEVICE_ID,
+    Array.from({ length: 25 }, (_, i) => ({
+      kind: "event" as const,
+      name: "lease_end",
+      extra: {
+        device_id: DEVICE_ID,
+        command: `flash-tool run ${i}`,
+        pid: 6000 + i,
+        token: `tok-${i}`,
+        exit_code: 0,
+        duration_ms: 1_000,
+        reason: "released",
+      },
+    })),
+  );
+
+  const rows = page.locator('[data-testid="client-row"][data-status="offline"]');
+  await expect(rows).toHaveCount(20, { timeout: 5_000 });
+  await expect(rows.last()).toContainText("flash-tool run 24");
+  await expect(page.getByTestId("clients-omitted")).toContainText("5 older finished leases");
+});
+
 // ---- T5.5 acceptance criterion 3: kicking a client closes its connection ----
 
 test("kicking an agent closes its connection with an observable error, not a silent hang", async ({ page }) => {

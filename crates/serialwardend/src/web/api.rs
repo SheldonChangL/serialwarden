@@ -1085,6 +1085,12 @@ fn lease_end_to_json(device_id: &str, event: &OobRecord) -> Value {
 /// `port::append_lease_end_event` for every lease, GUI or not. This is the
 /// same "audit is a query view, not a second store" principle the audit
 /// panel ([`audit`]) applies, extended to one more panel.
+/// How many finished leases `GET /api/clients` returns. The clients panel
+/// polls this every two seconds, and a bench that flashes all day piles up
+/// hundreds of `lease_end` records; the panel only needs the recent ones,
+/// and the full history stays in the audit view and the record stream.
+const FINISHED_LEASES_SHOWN: usize = 20;
+
 async fn list_clients(State(shared): State<Arc<Shared>>) -> Json<Value> {
     let live: Vec<Value> = shared
         .clients
@@ -1103,11 +1109,26 @@ async fn list_clients(State(shared): State<Arc<Shared>>) -> Json<Value> {
             .get_or_spawn(&summary.id, Arc::clone(&recorder));
         state.ingest(&recorder);
         for event in state.query_events(&["lease_end".to_string()], None, None) {
-            finished_leases.push(lease_end_to_json(&summary.id.0, &event));
+            finished_leases.push((
+                event.t_wall.clone(),
+                lease_end_to_json(&summary.id.0, &event),
+            ));
         }
     }
+    // Newest last, across devices; keep only the most recent few.
+    finished_leases.sort_by(|a, b| a.0.cmp(&b.0));
+    let omitted = finished_leases.len().saturating_sub(FINISHED_LEASES_SHOWN);
+    let finished_leases: Vec<Value> = finished_leases
+        .into_iter()
+        .skip(omitted)
+        .map(|(_, lease)| lease)
+        .collect();
 
-    Json(json!({ "clients": live, "finished_leases": finished_leases }))
+    Json(json!({
+        "clients": live,
+        "finished_leases": finished_leases,
+        "finished_leases_omitted": omitted,
+    }))
 }
 
 fn client_not_found_response(client_id: u64) -> axum::response::Response {
@@ -1237,7 +1258,17 @@ const AUDIT_QUERY_KINDS: &[&str] = &[
 struct AuditParams {
     since_seq: Option<u64>,
     until_seq: Option<u64>,
+    /// Newest records to return; defaults to [`AUDIT_DEFAULT_LIMIT`] and is
+    /// clamped to [`AUDIT_MAX_LIMIT`].
+    limit: Option<usize>,
 }
+
+/// The audit panel re-fetches on a timer, and a long-lived device's audit
+/// history (every write, gate decision, lease, and config change) only
+/// grows. The panel shows the newest records and says how many it left out;
+/// `serialwarden audit` and export still reach all of them.
+const AUDIT_DEFAULT_LIMIT: usize = 500;
+const AUDIT_MAX_LIMIT: usize = 5_000;
 
 /// `GET /api/devices/:id/audit?since_seq=&until_seq=` (T5.5, issue #22): the
 /// audit panel's list. A pure filtered read over the same stream `tail`/
@@ -1267,8 +1298,13 @@ async fn audit(
     state.ingest(&recorder);
     let kinds: Vec<String> = AUDIT_QUERY_KINDS.iter().map(|s| s.to_string()).collect();
     let events = state.query_events(&kinds, params.since_seq, params.until_seq);
-    let rows: Vec<Value> = events.iter().map(event_to_json).collect();
-    Json(json!({ "audit": rows })).into_response()
+    let limit = params
+        .limit
+        .unwrap_or(AUDIT_DEFAULT_LIMIT)
+        .clamp(1, AUDIT_MAX_LIMIT);
+    let omitted = events.len().saturating_sub(limit);
+    let rows: Vec<Value> = events.iter().skip(omitted).map(event_to_json).collect();
+    Json(json!({ "audit": rows, "omitted": omitted })).into_response()
 }
 
 /// Query params for [`export_device`]. `from`/`to` are each either a plain
@@ -2249,6 +2285,44 @@ mod tests {
             permission,
             Arc::new(tokio::sync::Notify::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn list_clients_returns_only_the_most_recent_finished_leases() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        for i in 0..(FINISHED_LEASES_SHOWN + 7) {
+            let mut extra = serde_json::Map::new();
+            extra.insert("command".into(), json!(format!("flash-{i}")));
+            recorder.append_event("lease_end", extra).unwrap();
+        }
+        let (status, body) = get(crate::web::router(shared), "/api/clients").await;
+        assert_eq!(status, StatusCode::OK);
+        let leases = body["finished_leases"].as_array().unwrap();
+        assert_eq!(leases.len(), FINISHED_LEASES_SHOWN);
+        assert_eq!(body["finished_leases_omitted"], 7);
+        let last = FINISHED_LEASES_SHOWN + 6;
+        assert_eq!(leases.last().unwrap()["command"], format!("flash-{last}"));
+    }
+
+    #[tokio::test]
+    async fn audit_returns_the_newest_records_and_counts_the_rest() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        for i in 0..(AUDIT_DEFAULT_LIMIT as u64 + 30) {
+            recorder.append_gate("deny", "danger:erase", i).unwrap();
+        }
+        let router = crate::web::router(shared);
+        let (status, body) = get(router.clone(), "/api/devices/dev-1/audit").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["audit"].as_array().unwrap().len(), AUDIT_DEFAULT_LIMIT);
+        assert_eq!(body["omitted"], 30);
+        let newest = body["audit"].as_array().unwrap().last().unwrap()["request_seq"].clone();
+        assert_eq!(newest, AUDIT_DEFAULT_LIMIT as u64 + 29);
+
+        let (_, small) = get(router, "/api/devices/dev-1/audit?limit=10").await;
+        assert_eq!(small["audit"].as_array().unwrap().len(), 10);
+        assert_eq!(small["omitted"], AUDIT_DEFAULT_LIMIT as u64 + 20);
     }
 
     #[tokio::test]
