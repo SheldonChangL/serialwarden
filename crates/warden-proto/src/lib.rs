@@ -12,6 +12,7 @@
 //! how these types are used across the daemon/client boundary.
 
 mod client;
+mod config_apply;
 mod error;
 mod hello;
 mod record;
@@ -19,6 +20,7 @@ mod request;
 mod wire_error;
 
 pub use client::ClientType;
+pub use config_apply::{ConfigApply, ConfigApplyOutcome};
 pub use error::ErrorCode;
 pub use hello::{HelloAck, HelloRequest, Permission};
 pub use record::{Kind, Record};

@@ -1406,6 +1406,8 @@ async fn agent_changes_baud_and_it_takes_effect_and_is_logged() {
         .await;
     assert_eq!(result["result"], "allowed", "{result}");
     assert_eq!(result["config"]["baud"], 74880, "{result}");
+    assert_eq!(result["applied"], true, "{result}");
+    assert!(result.get("note").is_none(), "{result}");
 
     // Immediately verifiable by the same agent, via the read-only
     // `get_config` tool -- exactly the "agent doubts the baud, checks its
@@ -1441,6 +1443,48 @@ async fn agent_changes_baud_and_it_takes_effect_and_is_logged() {
         Some(74880)
     );
     println!("acceptance #7 (T4.4) — agent's baud change took effect and was logged");
+
+    mcp.shutdown().await;
+}
+
+/// An agent testing a baud hypothesis must be told when the port refused the
+/// new baud: otherwise it reads output at the old baud and concludes the new
+/// one was wrong too.
+#[tokio::test]
+async fn set_config_tells_the_agent_when_the_port_did_not_apply_it() {
+    let tmp_data = tempfile::tempdir().expect("tempdir");
+    let recorder = Arc::new(
+        Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).expect("open recorder"),
+    );
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    backend.fail_live_apply(Some("Invalid argument (os error 22)".to_string()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("test.sock");
+    let listener = server::bind(&path).expect("bind test socket");
+    let shared = Arc::new(Shared::new(
+        backend as Arc<dyn DeviceBackend>,
+        "test",
+        dir.path(),
+    ));
+    tokio::spawn(server::serve(listener, shared));
+
+    let mut mcp = McpProcess::spawn(&path);
+    mcp.initialize().await;
+    let result = mcp
+        .call_tool("set_config", json!({"device": "dev", "baud": 74880}))
+        .await;
+    assert_eq!(result["result"], "allowed", "{result}");
+    assert_eq!(result["config"]["baud"], 74880, "{result}");
+    assert_eq!(result["changed"], true, "{result}");
+    assert_eq!(result["applied"], false, "{result}");
+    assert_eq!(result["apply"], "failed", "{result}");
+    assert_eq!(
+        result["apply_error"], "Invalid argument (os error 22)",
+        "{result}"
+    );
+    let note = result["note"].as_str().expect("a note for the agent");
+    assert!(note.contains("NOT applied"), "{note}");
 
     mcp.shutdown().await;
 }

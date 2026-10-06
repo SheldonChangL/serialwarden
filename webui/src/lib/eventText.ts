@@ -124,27 +124,81 @@ function describeConnect(extra: Extra): EventDescription {
   return { summary: "Port opened", detail, tone: "rx" };
 }
 
+/** When a `config_change`/`config_reapplied` says the port did not take the
+ * settings (`applied: false`), the words for why — or `null` when it did, or
+ * when the record predates the `applied` field (unknown is not "failed").
+ * Saved and running are different facts; a row that only said "baud
+ * 74880" while the port was still at 115200 is the exact lie this exists to
+ * prevent. */
+function notApplied(extra: Extra): { summary: string; detail: string } | null {
+  if (extra.applied !== false) return null;
+  if (extra.apply === "not_connected") {
+    return { summary: "saved, applies when the port next opens", detail: "port not open (device disconnected or leased)" };
+  }
+  return {
+    summary: "saved, NOT applied to the port",
+    detail: `port rejected it: ${str(extra.apply_error) ?? "unknown error"} · still running the previous settings until it reconnects`,
+  };
+}
+
+function joinDetail(...parts: Array<string | null>): string | null {
+  const kept = parts.filter((p): p is string => p !== null);
+  return kept.length > 0 ? kept.join(" · ") : null;
+}
+
 function describeConfigChange(extra: Extra): EventDescription {
   const next = (extra.new ?? null) as PortConfigLike | null;
   const old = (extra.old ?? null) as PortConfigLike | null;
   const by = actor(extra.changed_by);
+  const failed = notApplied(extra);
   if (!next) return { summary: "Port settings changed", detail: by, tone: "warn" };
   if (!old) {
     // First config ever applied to this device — a statement of the
     // starting state, not a change. Saying "9600 → 9600" here would be a
     // lie, and saying "changed" would send someone hunting for who did it.
+    const summary = `Port set to ${formatConfig(next)}`;
+    if (!failed) return { summary, detail: by ? `by ${by}` : null, tone: "rx" };
     return {
-      summary: `Port set to ${formatConfig(next)}`,
-      detail: by ? `by ${by}` : null,
-      tone: "rx",
+      summary: `${summary} — ${failed.summary}`,
+      detail: joinDetail(failed.detail, by ? `by ${by}` : null),
+      tone: "gate",
     };
   }
   const diff = configDiff(old, next);
+  // Since issue #51 the daemon never records an unchanged config_change;
+  // this branch only reads records written before that.
   if (diff.length === 0) {
     return { summary: "Port settings reapplied, nothing changed", detail: by, tone: "warn" };
   }
+  if (failed) {
+    return {
+      summary: `${diff.join(", ")} — ${failed.summary}`,
+      detail: joinDetail(failed.detail, by ? `by ${by}` : null),
+      tone: extra.apply === "not_connected" ? "warn" : "gate",
+    };
+  }
   return {
     summary: diff.join(", "),
+    detail: by ? `by ${by}` : null,
+    tone: "warn",
+  };
+}
+
+/** The saved settings did not change, but the port had not taken them, so
+ * a request retried the port (`device_profile::append_set_config_events`). */
+function describeConfigReapplied(extra: Extra): EventDescription {
+  const config = (extra.config ?? null) as PortConfigLike | null;
+  const by = actor(extra.changed_by);
+  const failed = notApplied(extra);
+  if (failed) {
+    return {
+      summary: `Retried ${formatConfig(config)} — ${failed.summary}`,
+      detail: joinDetail(failed.detail, by ? `by ${by}` : null),
+      tone: "gate",
+    };
+  }
+  return {
+    summary: `Port now running ${formatConfig(config)} (retried)`,
     detail: by ? `by ${by}` : null,
     tone: "warn",
   };
@@ -218,6 +272,9 @@ export function describeEvent(name: string, extra: Extra): EventDescription {
 
     case "config_change":
       return describeConfigChange(extra);
+
+    case "config_reapplied":
+      return describeConfigReapplied(extra);
 
     case "control_line_change": {
       const line = (str(extra.line) ?? "line").toUpperCase();

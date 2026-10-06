@@ -55,6 +55,7 @@ const AUDIT_EVENT_NAMES: &[&str] = &[
     "lease_start",
     "lease_end",
     "config_change",
+    "config_reapplied",
     "control_line_change",
     "dtr_pulse",
     "client_kicked",

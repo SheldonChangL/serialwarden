@@ -190,6 +190,41 @@ test("one Apply sends one request and records one config_change; an unchanged Ap
   await expect(page.locator('[data-row-kind="event"][data-event-name="config_change"]')).toHaveCount(1);
 });
 
+// ---- A change the port rejects is saved, but never shown as applied ----
+
+test("a baud the port rejects keeps the popover open with the error and logs it as not applied", async ({
+  page,
+}) => {
+  const portError = "Invalid argument (os error 22)";
+  daemon = await startDaemon({ testDeviceId: DEVICE_ID, applyError: portError });
+  await page.goto(daemon.url);
+  await expect(page.getByTestId("connection-dot")).toHaveAttribute("data-state", "open", {
+    timeout: 10_000,
+  });
+
+  await page.getByTestId("config-chip").click();
+  const popover = page.getByTestId("config-popover");
+  await expect(popover).toBeVisible({ timeout: 5_000 });
+  await page.getByTestId("baud-input").fill("74880");
+  await page.getByTestId("apply-config").click();
+
+  // Not dismissed as if it had worked: the popover stays, naming the error.
+  const error = page.getByTestId("config-apply-error");
+  await expect(error).toBeVisible({ timeout: 10_000 });
+  await expect(error).toContainText("NOT applied");
+  await expect(error).toContainText(portError);
+  await expect(popover).toBeVisible();
+
+  // The timeline row says the same, and so does the stored record.
+  const row = page.locator('[data-row-kind="event"][data-event-name="config_change"]').last();
+  await expect(row).toContainText("NOT applied", { timeout: 10_000 });
+  const stored = await storedConfigChanges();
+  expect(stored).toHaveLength(1);
+  expect(stored[0].applied).toBe(false);
+  expect(stored[0].apply).toBe("failed");
+  expect(stored[0].apply_error).toBe(portError);
+});
+
 // ---- Acceptance criterion 4: garbled-stream baud suggestion ----
 
 test("a mostly-undecodable rx burst surfaces a baud suggestion in the settings popover", async ({ page }) => {

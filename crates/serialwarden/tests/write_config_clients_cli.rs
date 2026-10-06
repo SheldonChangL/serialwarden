@@ -219,6 +219,16 @@ fn find_gate_deny_seq(recorder: &Recorder) -> u64 {
 }
 
 async fn start_plain_daemon(device_id: &str) -> (TestDaemon, tempfile::TempDir) {
+    start_plain_daemon_rejecting_live_apply(device_id, None).await
+}
+
+/// [`start_plain_daemon`], with the device's port rejecting every live
+/// configuration apply with `apply_error` when given (see
+/// `TestBackend::fail_live_apply`).
+async fn start_plain_daemon_rejecting_live_apply(
+    device_id: &str,
+    apply_error: Option<&str>,
+) -> (TestDaemon, tempfile::TempDir) {
     let tmp_data = tempfile::tempdir().expect("tempdir");
     let recorder = Arc::new(
         Recorder::open(tmp_data.path(), device_id, RecorderConfig::default())
@@ -226,6 +236,7 @@ async fn start_plain_daemon(device_id: &str) -> (TestDaemon, tempfile::TempDir) 
     );
     let backend = Arc::new(TestBackend::new());
     backend.register(DeviceId(device_id.to_string()), recorder);
+    backend.fail_live_apply(apply_error.map(str::to_string));
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.sock");
@@ -417,6 +428,51 @@ async fn config_cli_write_updates_baud_and_prints_the_new_config() {
         stdout_text(&output).contains("baud=74880"),
         "text: {}",
         stdout_text(&output)
+    );
+}
+
+/// A baud change the port rejects must not look like success: the CLI says
+/// it was saved but not applied, names the port's error, and exits non-zero
+/// so a script does not carry on as if the port were at the new baud.
+#[tokio::test]
+async fn config_cli_write_the_port_rejects_says_not_applied_and_exits_nonzero() {
+    let (daemon, _datadir) =
+        start_plain_daemon_rejecting_live_apply("dev", Some("Invalid argument (os error 22)"))
+            .await;
+
+    let output = cli(&daemon.socket_path, &["config", "dev", "--baud", "74880"])
+        .output()
+        .await
+        .expect("run config");
+    let text = stdout_text(&output);
+    let stderr = stderr_text(&output);
+    assert!(!output.status.success(), "stdout: {text}\nstderr: {stderr}");
+    assert!(text.contains("NOT applied"), "text: {text}");
+    assert!(
+        text.contains("Invalid argument (os error 22)"),
+        "text: {text}"
+    );
+    assert!(!text.contains("config updated"), "text: {text}");
+    // The saved configuration is still shown, since that is what the next
+    // open applies.
+    assert!(text.contains("baud=74880"), "text: {text}");
+    assert!(stderr.contains("not in effect"), "stderr: {stderr}");
+}
+
+/// Setting what is already in effect says so instead of claiming an update.
+#[tokio::test]
+async fn config_cli_write_of_the_current_config_reports_unchanged() {
+    let (daemon, _datadir) = start_plain_daemon("dev").await;
+
+    let output = cli(&daemon.socket_path, &["config", "dev", "--baud", "9600"])
+        .output()
+        .await
+        .expect("run config");
+    assert!(output.status.success(), "stderr: {}", stderr_text(&output));
+    let text = stdout_text(&output);
+    assert!(
+        text.contains("config unchanged (already in effect)"),
+        "text: {text}"
     );
 }
 

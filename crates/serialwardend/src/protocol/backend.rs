@@ -22,6 +22,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::device_profile::SetConfigOutcome;
 use crate::error_counts::ErrorCounts;
 use crate::port::{
     DeviceId, DeviceSummary, LeaseAcquired, LeaseError, LeaseReleased, PortConfigApi,
@@ -40,13 +41,16 @@ pub trait DeviceBackend: Send + Sync {
     fn get_config(&self, id: &DeviceId) -> io::Result<PortConfig>;
     /// Merge `patch` (a partial `PortConfig` field set — see
     /// `warden_proto::Request::SetConfig`'s docs) onto the current
-    /// configuration and apply it. Returns the resulting full config.
+    /// configuration, save it, and apply it to the open port. Returns the
+    /// resulting full config plus whether it changed and whether the port
+    /// took it (see `port::PortConfigApi::set_port_config`): a port that
+    /// rejects the change is an `Ok` saying so, not an `Err`.
     fn set_config(
         &self,
         id: &DeviceId,
         patch: &serde_json::Map<String, serde_json::Value>,
         changed_by: &str,
-    ) -> io::Result<PortConfig>;
+    ) -> io::Result<SetConfigOutcome>;
     fn set_control_line(
         &self,
         id: &DeviceId,
@@ -150,13 +154,15 @@ impl DeviceBackend for LiveBackend {
         id: &DeviceId,
         patch: &serde_json::Map<String, serde_json::Value>,
         changed_by: &str,
-    ) -> io::Result<PortConfig> {
-        let current = self.config_api.get_config(id)?;
-        let merged = merge_config_patch(&current, patch)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        self.config_api
-            .set_port_config(id, merged.clone(), changed_by)?;
-        Ok(merged)
+    ) -> io::Result<SetConfigOutcome> {
+        self.config_api.update_port_config(
+            id,
+            |current| {
+                merge_config_patch(current, patch)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+            },
+            changed_by,
+        )
     }
 
     fn set_control_line(
@@ -239,6 +245,9 @@ pub mod testing {
     struct Entry {
         recorder: Arc<Recorder>,
         config: PortConfig,
+        /// Mirrors `port::LiveDeviceConfig::live_config`: what the
+        /// (imaginary) open port is running, `None` after a failed apply.
+        live_config: Option<PortConfig>,
         path: Option<std::path::PathBuf>,
         connected: bool,
         /// A writable fd a test registered via [`TestBackend::register_writer`]
@@ -262,11 +271,26 @@ pub mod testing {
     #[derive(Default)]
     pub struct TestBackend {
         devices: Mutex<HashMap<DeviceId, Entry>>,
+        /// When set, every live apply `set_config` attempts fails with this
+        /// message — see [`Self::fail_live_apply`].
+        live_apply_error: Mutex<Option<String>>,
     }
 
     impl TestBackend {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// Make every live apply `set_config` attempts on a connected device
+        /// fail with `error` (or succeed again, with `None`), the way the real
+        /// port can reject a configuration it has already saved (see
+        /// `port::PortConfigApi::set_port_config`). The configuration is still
+        /// saved and the request still succeeds, reporting the failure.
+        pub fn fail_live_apply(&self, error: Option<String>) {
+            *self
+                .live_apply_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = error;
         }
 
         /// Register `recorder` as device `id`, connected, with the default
@@ -280,6 +304,7 @@ pub mod testing {
                     Entry {
                         recorder,
                         config: PortConfig::default(),
+                        live_config: Some(PortConfig::default()),
                         path: None,
                         connected: true,
                         writer: None,
@@ -312,6 +337,7 @@ pub mod testing {
                 .get_mut(id)
             {
                 entry.connected = connected;
+                entry.live_config = connected.then(|| entry.config.clone());
             }
         }
 
@@ -403,12 +429,23 @@ pub mod testing {
                 })
         }
 
+        /// Same decisions and events as `port::PortConfigApi::set_port_config`,
+        /// against in-memory state: unchanged and already running (or no port)
+        /// is a no-op; otherwise save, "apply" (failing if
+        /// [`Self::fail_live_apply`] says so), and record the outcome.
         fn set_config(
             &self,
             id: &DeviceId,
             patch: &serde_json::Map<String, serde_json::Value>,
             changed_by: &str,
-        ) -> io::Result<PortConfig> {
+        ) -> io::Result<SetConfigOutcome> {
+            use crate::device_profile::PortApply;
+
+            let live_apply_error = self
+                .live_apply_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let mut devices = self.devices.lock().unwrap_or_else(|e| e.into_inner());
             let entry = devices.get_mut(id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
@@ -416,20 +453,30 @@ pub mod testing {
             let old = entry.config.clone();
             let merged = merge_config_patch(&entry.config, patch)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            if old == merged {
-                // Same no-op rule as `PortConfigApi::set_port_config`.
-                return Ok(merged);
-            }
+            let changed = old != merged;
+            let port = if !entry.connected {
+                PortApply::not_connected()
+            } else if !changed && entry.live_config.as_ref() == Some(&merged) {
+                PortApply::already_applied()
+            } else {
+                match live_apply_error {
+                    None => PortApply::live(),
+                    Some(e) => PortApply::failed(e),
+                }
+            };
             entry.config = merged.clone();
+            if port.attempted() {
+                entry.live_config = port.applied().then(|| merged.clone());
+            }
             let recorder = Arc::clone(&entry.recorder);
             drop(devices);
-            crate::device_profile::append_config_change_event(
-                &recorder,
-                Some(&old),
-                &merged,
-                changed_by,
-            )?;
-            Ok(merged)
+            let outcome = SetConfigOutcome {
+                config: merged,
+                changed,
+                port,
+            };
+            crate::device_profile::append_set_config_events(&recorder, &old, &outcome, changed_by)?;
+            Ok(outcome)
         }
 
         fn set_control_line(

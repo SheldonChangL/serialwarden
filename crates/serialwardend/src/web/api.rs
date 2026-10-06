@@ -299,6 +299,12 @@ async fn get_config(
 /// `{"baud": 74880}`), same as the "還原" (revert) button, which replays a
 /// `config_change` event's whole `old` value back through this same
 /// endpoint. Ungated — see [`GUI_CHANGED_BY`]'s doc comment.
+///
+/// The reply is the UDS `set_config` reply's body
+/// ([`crate::device_profile::SetConfigOutcome::reply_body`]): `config` plus
+/// `changed`/`applied`/`apply`/`apply_error`. A port that rejected the change
+/// is still a 200 (the change was saved), with `applied: false`; the popover
+/// must show that rather than treat the 200 as "done".
 async fn set_config(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -307,7 +313,7 @@ async fn set_config(
     use axum::response::IntoResponse;
     let dev = DeviceId(id.clone());
     match shared.backend.set_config(&dev, &patch, GUI_CHANGED_BY) {
-        Ok(config) => Json(json!({ "config": config })).into_response(),
+        Ok(outcome) => Json(outcome.reply_body()).into_response(),
         Err(e) => backend_error_response(&e, &id),
     }
 }
@@ -1224,6 +1230,7 @@ const AUDIT_QUERY_KINDS: &[&str] = &[
     "lease_start",
     "lease_end",
     "config_change",
+    "config_reapplied",
     "control_line_change",
     "dtr_pulse",
     "client_kicked",

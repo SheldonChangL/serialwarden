@@ -661,12 +661,7 @@ async fn dispatch(
         Request::SetConfig { device, config } => {
             let dev = DeviceId(device.clone());
             match shared.backend.set_config(&dev, &config, changed_by) {
-                Ok(new_config) => send(
-                    shared,
-                    client_id,
-                    tx,
-                    ok_reply(id, serde_json::json!({ "config": new_config })),
-                ),
+                Ok(outcome) => send(shared, client_id, tx, ok_reply(id, outcome.reply_body())),
                 Err(e) => send(
                     shared,
                     client_id,

@@ -1424,6 +1424,57 @@ async fn set_config_over_the_wire_produces_a_config_change_event_and_never_touch
     println!("acceptance (T2.3) — config_change carries old/new over the wire; prior rx record unchanged: {config_change}");
 }
 
+/// The `set_config` reply says whether the port took the change, and a
+/// change the port rejected is a success (it was saved) that says so, with
+/// the port's error, rather than an unqualified `{"config": ...}`.
+#[tokio::test]
+async fn set_config_reply_reports_whether_the_port_applied_it() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) =
+        start_test_daemon(Arc::clone(&backend) as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "operator", "human").await;
+
+    c.send(json!({"id": 1, "op": "set_config", "device": "dev", "baud": 115200}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["changed"], true, "{reply}");
+    assert_eq!(reply["applied"], true, "{reply}");
+    assert_eq!(reply["apply"], "live", "{reply}");
+    assert!(reply.get("apply_error").is_none(), "{reply}");
+
+    backend.fail_live_apply(Some("Invalid argument (os error 22)".to_string()));
+    c.send(json!({"id": 2, "op": "set_config", "device": "dev", "baud": 74880}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "saved, so still a success: {reply}");
+    assert_eq!(reply["config"]["baud"], 74880, "{reply}");
+    assert_eq!(reply["changed"], true, "{reply}");
+    assert_eq!(reply["applied"], false, "{reply}");
+    assert_eq!(reply["apply"], "failed", "{reply}");
+    assert_eq!(reply["apply_error"], "Invalid argument (os error 22)");
+
+    let outcome: warden_proto::ConfigApplyOutcome =
+        serde_json::from_value(reply.clone()).expect("reply carries ConfigApplyOutcome");
+    assert!(!outcome.applied);
+
+    let records = recorder.read_since(0, usize::MAX).unwrap().records;
+    let applied: Vec<Value> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Event { event, extra, .. } if event == "config_change" => {
+                Some(extra["applied"].clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(applied, vec![json!(true), json!(false)]);
+}
+
 /// `config_change` events in a `read_since` reply, minus the
 /// `system:connect` profile application every connect records.
 fn client_config_changes(read_reply: &Value) -> Vec<Value> {
