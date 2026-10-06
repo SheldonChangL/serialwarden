@@ -22,8 +22,6 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nix::pty::openpty;
-use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -85,14 +83,9 @@ fn short_timeout_gate(timeout: Duration) -> Gate {
 }
 
 fn open_raw_pty_pair() -> (std::fs::File, std::fs::File) {
-    let pair = openpty(None, None).expect("openpty");
-    let mut attrs = tcgetattr(&pair.slave).expect("tcgetattr");
-    cfmakeraw(&mut attrs);
-    tcsetattr(&pair.slave, SetArg::TCSANOW, &attrs).expect("tcsetattr");
-    (
-        std::fs::File::from(pair.master),
-        std::fs::File::from(pair.slave),
-    )
+    // Through mock-device, so PTY creation is serialized with every other
+    // PTY this test binary opens (macOS openpty() is not thread-safe).
+    mock_device::raw_pty_pair().expect("raw pty pair")
 }
 
 async fn start_daemon_with_gate_and_pty(

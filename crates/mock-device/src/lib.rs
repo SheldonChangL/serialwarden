@@ -33,4 +33,5 @@ mod responder;
 pub mod script;
 
 pub use device::MockDevice;
+pub use pty::raw_pty_pair;
 pub use responder::Pattern;
