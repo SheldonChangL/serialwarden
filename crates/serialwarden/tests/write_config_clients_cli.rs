@@ -219,6 +219,16 @@ fn find_gate_deny_seq(recorder: &Recorder) -> u64 {
 }
 
 async fn start_plain_daemon(device_id: &str) -> (TestDaemon, tempfile::TempDir) {
+    start_plain_daemon_rejecting_live_apply(device_id, None).await
+}
+
+/// [`start_plain_daemon`], with the device's port rejecting every live
+/// configuration apply with `apply_error` when given (see
+/// `TestBackend::fail_live_apply`).
+async fn start_plain_daemon_rejecting_live_apply(
+    device_id: &str,
+    apply_error: Option<&str>,
+) -> (TestDaemon, tempfile::TempDir) {
     let tmp_data = tempfile::tempdir().expect("tempdir");
     let recorder = Arc::new(
         Recorder::open(tmp_data.path(), device_id, RecorderConfig::default())
@@ -226,6 +236,7 @@ async fn start_plain_daemon(device_id: &str) -> (TestDaemon, tempfile::TempDir) 
     );
     let backend = Arc::new(TestBackend::new());
     backend.register(DeviceId(device_id.to_string()), recorder);
+    backend.fail_live_apply(apply_error.map(str::to_string));
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.sock");
@@ -420,6 +431,51 @@ async fn config_cli_write_updates_baud_and_prints_the_new_config() {
     );
 }
 
+/// A baud change the port rejects must not look like success: the CLI says
+/// it was saved but not applied, names the port's error, and exits non-zero
+/// so a script does not carry on as if the port were at the new baud.
+#[tokio::test]
+async fn config_cli_write_the_port_rejects_says_not_applied_and_exits_nonzero() {
+    let (daemon, _datadir) =
+        start_plain_daemon_rejecting_live_apply("dev", Some("Invalid argument (os error 22)"))
+            .await;
+
+    let output = cli(&daemon.socket_path, &["config", "dev", "--baud", "74880"])
+        .output()
+        .await
+        .expect("run config");
+    let text = stdout_text(&output);
+    let stderr = stderr_text(&output);
+    assert!(!output.status.success(), "stdout: {text}\nstderr: {stderr}");
+    assert!(text.contains("NOT applied"), "text: {text}");
+    assert!(
+        text.contains("Invalid argument (os error 22)"),
+        "text: {text}"
+    );
+    assert!(!text.contains("config updated"), "text: {text}");
+    // The saved configuration is still shown, since that is what the next
+    // open applies.
+    assert!(text.contains("baud=74880"), "text: {text}");
+    assert!(stderr.contains("not in effect"), "stderr: {stderr}");
+}
+
+/// Setting what is already in effect says so instead of claiming an update.
+#[tokio::test]
+async fn config_cli_write_of_the_current_config_reports_unchanged() {
+    let (daemon, _datadir) = start_plain_daemon("dev").await;
+
+    let output = cli(&daemon.socket_path, &["config", "dev", "--baud", "9600"])
+        .output()
+        .await
+        .expect("run config");
+    assert!(output.status.success(), "stderr: {}", stderr_text(&output));
+    let text = stdout_text(&output);
+    assert!(
+        text.contains("config unchanged (already in effect)"),
+        "text: {text}"
+    );
+}
+
 #[tokio::test]
 async fn clients_cli_lists_a_connected_client_with_verified_pid_and_type() {
     let (daemon, _datadir) = start_plain_daemon("dev").await;
@@ -583,13 +639,12 @@ async fn audit_listing_shows_full_traceability_matches_export_format_and_filters
         "text: {text}"
     );
     assert!(text.contains("gate=human_rw"), "text: {text}");
-    // The written bytes are fully recoverable -- `cli::render`'s existing
-    // tx rendering treats the trailing `\n` `write`'s default line ending
-    // appends as a control byte, so a short payload like this renders as a
-    // `[N bytes binary — hex]` summary rather than plain text (same
-    // behavior `tail` already has for a tx echo) -- the exact hex is still
-    // the complete, unambiguous original bytes, not truncated.
-    assert!(text.contains("6f 6b 0a"), "text: {text}");
+    // The written bytes are fully recoverable: `write`'s default line ending
+    // is a trailing `\n`, which is a terminator, not binary (issue #48), so
+    // the payload shows as text with the terminator escaped, not as a
+    // `[N bytes binary]` summary.
+    assert!(text.contains("gate=human_rw ok\\n"), "text: {text}");
+    assert!(!text.contains("bytes binary"), "text: {text}");
 
     // The denied write: full traceability even though it never produced a
     // `tx` record -- requester identity, matched rule, and the *complete*

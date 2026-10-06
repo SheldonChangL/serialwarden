@@ -1,6 +1,12 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { fetchDeviceConfig, setControlLines, setDeviceConfig, type DeviceConfig } from "./logStream";
+  import {
+    fetchDeviceConfig,
+    notAppliedMessage,
+    setControlLines,
+    setDeviceConfig,
+    type DeviceConfig,
+  } from "./logStream";
   import { describeOutcome, runBaudTrial, trialRunning, type TrialOutcome } from "./baudTrial";
 
   interface Props {
@@ -75,6 +81,9 @@
   let decodeHealth = $state<DeviceConfig["decode_health"]>(undefined);
   let loadError = $state<string | null>(null);
   let applyError = $state<string | null>(null);
+  /** Saved for a device that isn't connected: not an error, but not
+   * "applied" either. */
+  let applyNotice = $state<string | null>(null);
   let applying = $state(false);
   let controlLineBusy = $state(false);
 
@@ -164,6 +173,7 @@
   async function applyConfig(): Promise<void> {
     applying = true;
     applyError = null;
+    applyNotice = null;
     try {
       const patch: Record<string, unknown> = {
         baud,
@@ -175,8 +185,18 @@
           ? { mode: "preserve" }
           : { mode: "assert", dtr: dtrAssert, rts: rtsAssert },
       };
-      await setDeviceConfig(deviceId, patch);
+      const result = await setDeviceConfig(deviceId, patch);
+      // The settings were saved either way, so the chip should show them.
       onApplied();
+      const notApplied = notAppliedMessage(result);
+      if (notApplied !== null) {
+        // Saved but not running on the port: a 200 is not "done". Stay open
+        // and say so; closing here is how the operator came to believe a
+        // baud change had taken effect when the port had refused it.
+        if (result.apply === "failed") applyError = notApplied;
+        else applyNotice = notApplied;
+        return;
+      }
       // Dismiss on success: the settings are applied, the config chip
       // behind this popover already shows the new framing, and the
       // `config_change` row (with its one-click undo) has just landed in
@@ -358,6 +378,9 @@
     {#if applyError}
       <p class="error" data-testid="config-apply-error">{applyError}</p>
     {/if}
+    {#if applyNotice}
+      <p class="notice" data-testid="config-apply-notice">{applyNotice}</p>
+    {/if}
 
     <div class="footer">
       <button type="button" data-testid="apply-config" disabled={applying} onclick={applyConfig}>Apply</button>
@@ -482,6 +505,10 @@
 
   .error {
     color: var(--dot-closed);
+    margin: 0;
+  }
+  .notice {
+    color: var(--text-dim);
     margin: 0;
   }
 

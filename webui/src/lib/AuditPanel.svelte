@@ -26,7 +26,7 @@
    * `ApprovalCardHost.svelte`'s `POLL_INTERVAL_MS`. */
   const POLL_INTERVAL_MS = 2_000;
 
-  type LoadState = { kind: "loading" } | { kind: "error"; message: string } | { kind: "loaded"; rows: AuditRow[] };
+  type LoadState = { kind: "loading" } | { kind: "error"; message: string } | { kind: "loaded"; rows: AuditRow[]; omitted: number };
 
   let panelState = $state<LoadState>({ kind: "loading" });
   let filterText = $state("");
@@ -36,8 +36,8 @@
 
   async function load(): Promise<void> {
     try {
-      const rows = await fetchAudit(deviceId);
-      panelState = { kind: "loaded", rows };
+      const page = await fetchAudit(deviceId);
+      panelState = { kind: "loaded", rows: page.rows, omitted: page.omitted };
     } catch (e) {
       panelState = { kind: "error", message: e instanceof Error ? e.message : String(e) };
     }
@@ -140,6 +140,12 @@
         </li>
       {/each}
     </ul>
+    {#if panelState.kind === "loaded" && panelState.omitted > 0}
+      <p class="hint" data-testid="audit-omitted">
+        Showing the newest {panelState.rows.length} records; {panelState.omitted} older ones are available through
+        <code>serialwarden audit</code> or export.
+      </p>
+    {/if}
   {/if}
 </section>
 

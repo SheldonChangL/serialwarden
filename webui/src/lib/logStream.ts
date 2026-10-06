@@ -90,11 +90,23 @@ export async function fetchDeviceConfig(deviceId: string): Promise<DeviceConfig>
  * back the event's whole `old` value) and get the merged, full config back.
  * Ungated — see `crates/serialwardend/src/web/api.rs`'s `GUI_CHANGED_BY` doc
  * comment for why the web GUI's own config/control-line writes never go
- * through the write gate. */
+ * through the write gate.
+ *
+ * A 200 means the configuration was *saved*, not that the port is running
+ * it: `applied` says that, and `apply` says why not (`not_connected`, or
+ * `failed` with the port's `apply_error`). See `warden_proto::ConfigApply`. */
+export interface SetConfigResult {
+  config: Record<string, unknown>;
+  changed: boolean;
+  applied: boolean;
+  apply: "live" | "already_applied" | "not_connected" | "failed";
+  apply_error?: string;
+}
+
 export async function setDeviceConfig(
   deviceId: string,
   patch: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
+): Promise<SetConfigResult> {
   const res = await fetch(`/api/devices/${encodeURIComponent(deviceId)}/config`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -106,8 +118,20 @@ export async function setDeviceConfig(
       `POST config failed: ${res.status} ${(body as { error?: { message?: string } }).error?.message ?? res.statusText}`,
     );
   }
-  const body = (await res.json()) as { config: Record<string, unknown> };
-  return body.config;
+  return (await res.json()) as SetConfigResult;
+}
+
+/** What to tell the operator when a `setDeviceConfig` saved the settings but
+ * the port is not running them, or `null` when it is. */
+export function notAppliedMessage(result: SetConfigResult): string | null {
+  if (result.applied) return null;
+  if (result.apply === "not_connected") {
+    return "Saved. The port isn't open (device disconnected or leased); these settings apply when it next opens.";
+  }
+  return (
+    `Saved, but NOT applied: the port rejected it (${result.apply_error ?? "unknown error"}). ` +
+    "It keeps running its previous settings until the device reconnects."
+  );
 }
 
 /** `POST /api/devices/:id/control_lines` (`TASKS.md` T5.3, issue #20): the

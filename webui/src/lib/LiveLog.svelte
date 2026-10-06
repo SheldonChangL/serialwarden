@@ -306,8 +306,64 @@
 
   const BOTTOM_EPS = ROW_HEIGHT / 2;
 
+  /** How long after a user input event (or after the last scroll event it
+   * caused) a scroll event still counts as the user's doing. Wheel and
+   * touch-fling scrolling keep emitting scroll events for a few hundred ms
+   * after the input itself; each such event renews the window, so a long
+   * fling stays "user" while a lone scroll event that arrives with no recent
+   * input does not. */
+  const USER_SCROLL_WINDOW_MS = 400;
+  let lastUserInputAt = Number.NEGATIVE_INFINITY;
+  /** A pointer (a scrollbar thumb drag, in practice) is held down
+   * on the viewport; a drag can pause for longer than the window above
+   * before it moves again. */
+  let pointerHeld = false;
+
+  function noteUserInput(): void {
+    lastUserInputAt = performance.now();
+  }
+
+  /** Keys that move the viewport *away from the tail*; the others (PageDown,
+   * End, ...) only ever move toward it, which `onScroll`'s at-bottom check
+   * already handles without needing any intent. */
+  const SCROLL_UP_KEYS = new Set(["PageUp", "ArrowUp", "Home"]);
+
+  function onKeydown(e: KeyboardEvent): void {
+    if (SCROLL_UP_KEYS.has(e.key)) noteUserInput();
+  }
+
+  function onViewportPointerdown(): void {
+    pointerHeld = true;
+    noteUserInput();
+  }
+
+  function releasePointer(): void {
+    pointerHeld = false;
+  }
+
+  /** `pointerup` is not reliably delivered after a native scrollbar drag, so
+   * a stuck `pointerHeld` is cleared the moment the pointer is seen moving
+   * with no button down. */
+  function onWindowPointermove(e: PointerEvent): void {
+    if (pointerHeld && e.buttons === 0) pointerHeld = false;
+  }
+
+  function isUserScroll(): boolean {
+    return pointerHeld || performance.now() - lastUserInputAt < USER_SCROLL_WINDOW_MS;
+  }
+
+  /** Scroll events come from the user *and* from the layout: when the
+   * approval card mounts above the log (or collapses), the viewport changes
+   * height and the browser clamps or shifts `scrollTop` and fires `scroll`
+   * though nobody touched anything. Only the former may pause following —
+   * the card is exactly when the operator needs the newest rows, and a
+   * spurious pause hides the request and then its decision. A scroll with no
+   * user input behind it while following is instead undone by re-pinning to
+   * the tail. */
   function onScroll(): void {
     if (!containerEl) return;
+    const userScroll = isUserScroll();
+    if (userScroll) noteUserInput();
     scrollTop = containerEl.scrollTop;
     viewportHeight = containerEl.clientHeight;
     const atBottom = scrollTop + viewportHeight >= totalHeight - BOTTOM_EPS;
@@ -317,7 +373,11 @@
         pendingCount = 0;
       }
     } else if (following) {
-      following = false;
+      if (userScroll) {
+        following = false;
+      } else {
+        scrollToBottom();
+      }
     }
   }
 
@@ -384,6 +444,7 @@
 
   let stream: LogStream | undefined;
   let resizeObserver: ResizeObserver | undefined;
+  let removeIntentListeners: (() => void) | undefined;
   let clockTimer: ReturnType<typeof setInterval> | undefined;
 
   onMount(() => {
@@ -399,6 +460,24 @@
       });
       resizeObserver.observe(containerEl);
     }
+    // The user-intent listeners (see `onScroll`) are attached by hand: they
+    // only *observe* input on a pane that is already scrollable, and svelte's
+    // a11y rules would otherwise want an interactive ARIA role on a log.
+    const intentTarget = containerEl;
+    const passive = { passive: true } as const;
+    intentTarget?.addEventListener("wheel", noteUserInput, passive);
+    intentTarget?.addEventListener("touchmove", noteUserInput, passive);
+    intentTarget?.addEventListener("pointerdown", onViewportPointerdown, passive);
+    // On `window`, not the viewport: a click leaves keyboard focus on <body>
+    // while Chrome still scrolls the pane under it, so the keydown never
+    // targets the pane itself.
+    window.addEventListener("keydown", onKeydown);
+    removeIntentListeners = () => {
+      intentTarget?.removeEventListener("wheel", noteUserInput);
+      intentTarget?.removeEventListener("touchmove", noteUserInput);
+      intentTarget?.removeEventListener("pointerdown", onViewportPointerdown);
+      window.removeEventListener("keydown", onKeydown);
+    };
     stream = new LogStream(deviceId, {
       onPage,
       onState: (state, detail) => {
@@ -416,6 +495,7 @@
   onDestroy(() => {
     stream?.stop();
     resizeObserver?.disconnect();
+    removeIntentListeners?.();
     if (clockTimer) clearInterval(clockTimer);
     if (highlightTimer) clearTimeout(highlightTimer);
   });
@@ -564,6 +644,13 @@
     return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   }
 </script>
+
+<svelte:window
+  onpointerup={releasePointer}
+  onpointercancel={releasePointer}
+  onblur={releasePointer}
+  onpointermove={onWindowPointermove}
+/>
 
 <section class="live-log" data-testid="live-log" data-device={deviceId}>
   <div class="status-bar" data-testid="status-bar">

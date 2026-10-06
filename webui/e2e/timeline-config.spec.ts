@@ -132,6 +132,99 @@ test("applying a custom baud broadcasts to every open client, logs a config_chan
   await page2.close();
 });
 
+// ---- Issue #51: one Apply is one request and one config_change ----
+
+/** Every `config_change` the daemon has stored for the test device, read
+ * through the audit endpoint (the same query layer the GUI log reads). */
+async function storedConfigChanges(): Promise<Array<Record<string, unknown>>> {
+  const res = await fetch(`${daemon!.url}/api/devices/${DEVICE_ID}/audit`);
+  if (!res.ok) throw new Error(`audit failed: ${res.status}`);
+  const body = (await res.json()) as { audit: Array<Record<string, unknown>> };
+  return body.audit.filter((row) => row.event === "config_change");
+}
+
+function isConfigPost(url: string, method: string): boolean {
+  return method === "POST" && new URL(url).pathname === `/api/devices/${DEVICE_ID}/config`;
+}
+
+test("one Apply sends one request and records one config_change; an unchanged Apply records none", async ({
+  page,
+}) => {
+  await gotoConnectedLiveLog(page);
+  const configPosts: string[] = [];
+  page.on("request", (req) => {
+    if (isConfigPost(req.url(), req.method())) configPosts.push(req.postData() ?? "");
+  });
+
+  await page.getByTestId("config-chip").click();
+  await expect(page.getByTestId("config-popover")).toBeVisible({ timeout: 5_000 });
+  await page.getByTestId("baud-input").fill("115200");
+  const applied = page.waitForResponse((r) => isConfigPost(r.url(), r.request().method()));
+  await page.getByTestId("apply-config").click();
+  await applied;
+  await expect(page.getByTestId("config-chip")).toContainText("115200", { timeout: 10_000 });
+
+  expect(configPosts, "one Apply click must send exactly one POST").toHaveLength(1);
+  const stored = await storedConfigChanges();
+  expect(stored).toHaveLength(1);
+  expect((stored[0].new as { baud: number }).baud).toBe(115200);
+  expect(stored[0].changed_by).toBe("gui");
+
+  // Apply again without changing anything: still one request per click,
+  // but the daemon records nothing for a configuration already in effect.
+  await page.getByTestId("config-chip").click();
+  await expect(page.getByTestId("baud-input")).toHaveValue("115200", { timeout: 5_000 });
+  const reapplied = page.waitForResponse((r) => isConfigPost(r.url(), r.request().method()));
+  await page.getByTestId("apply-config").click();
+  expect((await reapplied).ok()).toBe(true);
+  expect(configPosts).toHaveLength(2);
+  expect(await storedConfigChanges()).toHaveLength(1);
+
+  // The log shows it once too. The WS stream is ordered, so once a line
+  // injected after both applies has rendered, any config_change row either
+  // apply produced has rendered before it.
+  await injectLog(daemon!, DEVICE_ID, rxLines(["after both applies"]));
+  await expect(page.locator('[data-row-kind="line"]', { hasText: "after both applies" })).toBeVisible({
+    timeout: 10_000,
+  });
+  await expect(page.locator('[data-row-kind="event"][data-event-name="config_change"]')).toHaveCount(1);
+});
+
+// ---- A change the port rejects is saved, but never shown as applied ----
+
+test("a baud the port rejects keeps the popover open with the error and logs it as not applied", async ({
+  page,
+}) => {
+  const portError = "Invalid argument (os error 22)";
+  daemon = await startDaemon({ testDeviceId: DEVICE_ID, applyError: portError });
+  await page.goto(daemon.url);
+  await expect(page.getByTestId("connection-dot")).toHaveAttribute("data-state", "open", {
+    timeout: 10_000,
+  });
+
+  await page.getByTestId("config-chip").click();
+  const popover = page.getByTestId("config-popover");
+  await expect(popover).toBeVisible({ timeout: 5_000 });
+  await page.getByTestId("baud-input").fill("74880");
+  await page.getByTestId("apply-config").click();
+
+  // Not dismissed as if it had worked: the popover stays, naming the error.
+  const error = page.getByTestId("config-apply-error");
+  await expect(error).toBeVisible({ timeout: 10_000 });
+  await expect(error).toContainText("NOT applied");
+  await expect(error).toContainText(portError);
+  await expect(popover).toBeVisible();
+
+  // The timeline row says the same, and so does the stored record.
+  const row = page.locator('[data-row-kind="event"][data-event-name="config_change"]').last();
+  await expect(row).toContainText("NOT applied", { timeout: 10_000 });
+  const stored = await storedConfigChanges();
+  expect(stored).toHaveLength(1);
+  expect(stored[0].applied).toBe(false);
+  expect(stored[0].apply).toBe("failed");
+  expect(stored[0].apply_error).toBe(portError);
+});
+
 // ---- Acceptance criterion 4: garbled-stream baud suggestion ----
 
 test("a mostly-undecodable rx burst surfaces a baud suggestion in the settings popover", async ({ page }) => {
