@@ -106,7 +106,7 @@ test("gate rows say what the gate did, and a pending request never reads as allo
   await expect(label("allow")).toHaveText("Allowed");
 });
 
-test("duplicate lines fold and binary content collapses to a hex chip, both expandable", async ({
+test("duplicate lines fold, and a short binary row shows its hex without a click", async ({
   page,
 }) => {
   await gotoConnectedLiveLog(page);
@@ -127,10 +127,188 @@ test("duplicate lines fold and binary content collapses to a hex chip, both expa
   await foldRow.locator(".fold-toggle").click();
   await expect(foldRow).toContainText("collapse");
 
+  // This 14-byte row used to collapse to "14 bytes of binary · view as hex"
+  // and need a click (issue #48 changed that: at or under 32 bytes the hex
+  // is the row). The long-row collapse/expand behavior it used to cover now
+  // lives in the "long binary rows stay collapsed" test below.
   const binaryRow = page.locator('[data-binary="true"]').first();
-  await expect(binaryRow).toContainText("view as hex", { timeout: 10_000 });
-  await binaryRow.locator(".binary-toggle").click();
-  await expect(binaryRow).toContainText(/ff fe fd fc/);
+  await expect(binaryRow).toContainText(/ff fe fd fc 01 02 03 ff fe fd fc 01 02 03/, {
+    timeout: 10_000,
+  });
+  await expect(binaryRow).not.toContainText("view as hex");
+  await expect(binaryRow.locator(".binary-toggle")).toHaveCount(0);
+});
+
+// Issue #48. Binary rows for these tests: bytes 0x80..0xbf are lone UTF-8
+// continuation bytes (always invalid), so every row is classified binary;
+// the trailing 0x0a is the terminator the line assembler needs (see the note
+// in the test above) and is not part of the row's bytes.
+function binLine(length: number, first = 0): Buffer {
+  const bytes = Array.from({ length }, (_, i) => 0x80 + ((first + i) % 0x40));
+  return Buffer.from([...bytes, 0x0a]);
+}
+
+function hexOf(buf: Buffer): string {
+  return Array.from(buf.subarray(0, buf.length - 1))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join(" ");
+}
+
+const rxBytes = (buf: Buffer): InjectOp => ({ kind: "rx", data_b64: buf.toString("base64") });
+
+test("binary rows up to 32 bytes show their hex inline; 33 bytes and up stay collapsed", async ({
+  page,
+}) => {
+  await gotoConnectedLiveLog(page);
+  const one = binLine(1);
+  const at32 = binLine(32, 3);
+  const at33 = binLine(33, 5);
+  // Text rows between them: each binary row is its own run, so this tests the
+  // threshold alone, not merging.
+  await injectLog(daemon!, DEVICE_ID, [
+    rxBytes(one),
+    ...rxLines(["boot ok"]),
+    rxBytes(at32),
+    ...rxLines(["next"]),
+    rxBytes(at33),
+  ]);
+
+  const binaryRows = page.locator('[data-binary="true"]');
+  await expect(binaryRows).toHaveCount(3, { timeout: 10_000 });
+
+  // 1 byte and exactly 32 bytes: the hex is on screen with no interaction,
+  // and there is nothing to click.
+  for (const [i, buf] of [one, at32].entries()) {
+    const row = binaryRows.nth(i);
+    await expect(row.getByTestId("binary-hex")).toHaveText(hexOf(buf));
+    await expect(row).not.toContainText("view as hex");
+    await expect(row.locator(".binary-toggle")).toHaveCount(0);
+  }
+
+  // 33 bytes: collapsed, hex not shown until asked for.
+  const long = binaryRows.nth(2);
+  await expect(long).toContainText("33 bytes of binary");
+  await expect(long).toContainText("view as hex");
+  await expect(long.getByTestId("binary-hex")).toHaveCount(0);
+});
+
+test("long binary rows stay collapsed and expand and collapse on click", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  // 100 bytes: past the 64-byte preview the daemon sends, so expanding shows
+  // the preview with an ellipsis rather than pretending to be the whole row.
+  const long = binLine(100);
+  await injectLog(daemon!, DEVICE_ID, [rxBytes(long)]);
+
+  const row = page.locator('[data-binary="true"]').first();
+  await expect(row).toContainText("100 bytes of binary", { timeout: 10_000 });
+  await expect(row).toContainText("view as hex");
+  await expect(row.getByTestId("binary-hex")).toHaveCount(0);
+
+  await row.locator(".binary-toggle").click();
+  const preview = hexOf(long).split(" ").slice(0, 64).join(" ");
+  await expect(row.getByTestId("binary-hex")).toContainText(preview);
+  await expect(row.getByTestId("binary-hex")).toContainText("…");
+  await expect(row).not.toContainText("100 bytes of binary");
+
+  await row.locator(".binary-toggle").click();
+  await expect(row.getByTestId("binary-hex")).toHaveCount(0);
+  await expect(row).toContainText("100 bytes of binary");
+});
+
+test("adjacent binary fragments render as one run, each seq still traceable", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  // The issue's example: 1-, 4- and 6-byte pieces of one burst. Sent as
+  // separate recorder records (distinct seqs) in one request, so they land
+  // within the merge window of each other.
+  const a = binLine(1, 0);
+  const b = binLine(4, 1);
+  const c = binLine(6, 5);
+  await injectLog(daemon!, DEVICE_ID, [rxBytes(a), rxBytes(b), rxBytes(c)]);
+
+  const rows = page.locator('[data-binary="true"]');
+  await expect(rows).toHaveCount(1, { timeout: 10_000 });
+  const row = rows.first();
+  // One segment carrying all 11 bytes in order, inline (11 <= 32), not three
+  // rows and not behind a click.
+  await expect(row.getByTestId("binary-hex")).toHaveText(
+    [hexOf(a), hexOf(b), hexOf(c)].join(" "),
+  );
+  await expect(row.getByTestId("binary-parts")).toHaveText("· 3 fragments");
+  await expect(row.locator(".binary-toggle")).toHaveCount(0);
+  await expect(page.locator('[data-row-kind="line"]')).toHaveCount(1);
+
+  // Traceability: the row spans the first fragment's seq through the last's,
+  // and hovering lists every fragment with its own seq, time and size.
+  const first = Number(await row.getAttribute("data-seq"));
+  const last = Number(await row.getAttribute("data-last-seq"));
+  expect(last).toBeGreaterThan(first);
+  const title = (await row.locator(".binary-inline").getAttribute("title")) ?? "";
+  const fragments = title.split("\n");
+  expect(fragments).toHaveLength(3);
+  expect(fragments[0]).toContain(`seq ${first} `);
+  expect(fragments[0]).toContain("1 byte");
+  expect(fragments[1]).toContain("4 bytes");
+  expect(fragments[2]).toContain(`seq ${last} `);
+  expect(fragments[2]).toContain("6 bytes");
+});
+
+test("fragments from one read (same record) also merge into one run", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  // What a wrong-baud board really produces: one read containing several
+  // CR/LF bytes, so the daemon assembles it into several short "lines" that
+  // share a timestamp (and a seq — see `export.rs` on same-record lines).
+  const chunk = Buffer.concat([binLine(1, 0), binLine(4, 1), binLine(6, 5)]);
+  await injectLog(daemon!, DEVICE_ID, [rxBytes(chunk)]);
+
+  const rows = page.locator('[data-binary="true"]');
+  await expect(rows).toHaveCount(1, { timeout: 10_000 });
+  await expect(rows.first().getByTestId("binary-parts")).toHaveText("· 3 fragments");
+  await expect(page.locator('[data-row-kind="line"]')).toHaveCount(1);
+});
+
+test("a text row between binary rows ends the run", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  await injectLog(daemon!, DEVICE_ID, [
+    rxBytes(binLine(3, 0)),
+    ...rxLines(["ok"]),
+    rxBytes(binLine(3, 9)),
+  ]);
+  await expect(page.locator('[data-row-kind="line"]')).toHaveCount(3, { timeout: 10_000 });
+  await expect(page.locator('[data-binary="true"]')).toHaveCount(2);
+  await expect(page.getByTestId("binary-parts")).toHaveCount(0);
+});
+
+test("two binary bursts a moment apart stay two rows", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  // Nothing sits between them, but their similarity to each other is the
+  // baud-mismatch tell, and merging them would bury it. Time itself is the
+  // thing under test, so this waits a real 100ms (well past the 20ms merge
+  // window) between the two injections.
+  await injectLog(daemon!, DEVICE_ID, [rxBytes(binLine(4, 20))]);
+  const rows = page.locator('[data-binary="true"]');
+  await expect(rows).toHaveCount(1, { timeout: 10_000 });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await injectLog(daemon!, DEVICE_ID, [rxBytes(binLine(4, 20))]);
+  await expect(rows).toHaveCount(2, { timeout: 10_000 });
+  await expect(page.getByTestId("binary-parts")).toHaveCount(0);
+});
+
+test("a merged run longer than 32 bytes stays collapsed and expands to all its bytes", async ({
+  page,
+}) => {
+  await gotoConnectedLiveLog(page);
+  const parts = [binLine(20, 0), binLine(20, 20), binLine(10, 40)];
+  await injectLog(daemon!, DEVICE_ID, parts.map(rxBytes));
+
+  const row = page.locator('[data-binary="true"]');
+  await expect(row).toHaveCount(1, { timeout: 10_000 });
+  await expect(row).toContainText("50 bytes of binary");
+  await expect(row.getByTestId("binary-parts")).toHaveText("· 3 fragments");
+  await expect(row.getByTestId("binary-hex")).toHaveCount(0);
+
+  await row.locator(".binary-toggle").click();
+  await expect(row.getByTestId("binary-hex")).toHaveText(parts.map(hexOf).join(" "));
+  await expect(row.getByTestId("binary-parts")).toHaveText("· 50 bytes in 3 fragments");
 });
 
 test("ANSI color codes render as color, never as visible [1;34m noise", async ({ page }) => {
