@@ -17,6 +17,10 @@ UART / USB serial ── serialwarden ──┼── AI agent（MCP），本機
                       always)
 ```
 
+![SerialWarden 示範：在瀏覽器對遠端板子打指令、拒絕 AI agent 的 erase 請求、燒錄工具借用 port](docs/media/demo.gif)
+
+<sub>真機錄製：CH340 轉接的 Realtek Ameba 開發板接在 Ubuntu 22.04 上，瀏覽器透過 SSH tunnel 連線。lease 那段用的是佔用 port 4 秒、不寫入任何資料的替身腳本，並非真的燒錄。</sub>
+
 ## 解決哪些痛點
 
 - **「開著 serial monitor 就不能燒錄，關掉燒完再打開，開機 log 早就跑完了。」**

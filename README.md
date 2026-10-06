@@ -17,6 +17,10 @@ UART / USB serial ── serialwarden ──┼── AI agent over MCP, local o
                       always)
 ```
 
+![SerialWarden demo: typing into a remote board from the browser, denying an AI agent's erase request, and a flashing tool borrowing the port](docs/media/demo.gif)
+
+<sub>Recorded on real hardware: a Realtek Ameba board on a CH340 adapter, plugged into Ubuntu 22.04, with the browser connected over an SSH tunnel. The lease step uses a stand-in script that holds the port for 4 seconds and writes nothing; it isn't a real flash.</sub>
+
 ## The problems it solves
 
 - **"I can't flash while the monitor is open, and when I reopen it the boot log is gone."** The daemon holds the port and records from the moment the board enumerates. `serialwarden run -- esptool.py ...` lends the port to the flasher and takes it back when the tool exits, so the post-flash boot log lands in the same log, with the gap marked.
